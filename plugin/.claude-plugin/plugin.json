@@ -1,0 +1,21 @@
+{
+  "name": "3a-plugin",
+  "description": "Agentic AI Acceleration - Plan, track, and review AI agent projects on AWS. Orchestrates work, records architecture decisions, and verifies stage transitions around the aws-agents plugin.",
+  "author": {
+    "name": "sejkim"
+  },
+  "keywords": [
+    "aws",
+    "agent",
+    "architecture",
+    "planning",
+    "agentcore"
+  ],
+  "skills": "./skills/",
+  "commands": "./commands/",
+  "mcpServers": "./.mcp.json",
+  "version": "0.1.0",
+  "dependencies": [
+    { "name": "aws-agents" }
+  ]
+}
