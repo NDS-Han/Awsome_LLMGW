@@ -1,0 +1,107 @@
+[
+  {
+    "id": "sales-01",
+    "category": "sales",
+    "prompt": "What were the top 5 product categories by revenue in 2017?",
+    "expected_keywords": ["health_beauty", "watches_gifts", "bed_bath_table", "sports_leisure", "computers_accessories"],
+    "expected_numeric": true
+  },
+  {
+    "id": "sales-02",
+    "category": "sales",
+    "prompt": "How much total revenue was generated in Q4 2017?",
+    "expected_keywords": ["revenue", "2017"],
+    "expected_numeric": true
+  },
+  {
+    "id": "sales-03",
+    "category": "sales",
+    "prompt": "Compare monthly sales trends between 2017 and 2018.",
+    "expected_keywords": ["2017", "2018", "trend"],
+    "expected_numeric": true
+  },
+  {
+    "id": "sales-04",
+    "category": "sales",
+    "prompt": "What is the average order value across all categories?",
+    "expected_keywords": ["average", "order", "value"],
+    "expected_numeric": true
+  },
+  {
+    "id": "reviews-01",
+    "category": "reviews",
+    "prompt": "What is the overall customer satisfaction rate?",
+    "expected_keywords": ["satisfaction", "score"],
+    "expected_numeric": true
+  },
+  {
+    "id": "reviews-02",
+    "category": "reviews",
+    "prompt": "Which product categories have the lowest review scores?",
+    "expected_keywords": ["category", "score", "low"],
+    "expected_numeric": true
+  },
+  {
+    "id": "reviews-03",
+    "category": "reviews",
+    "prompt": "Analyze the distribution of 1-star reviews. What are common complaints?",
+    "expected_keywords": ["1", "star", "complaint"],
+    "expected_numeric": true
+  },
+  {
+    "id": "reviews-04",
+    "category": "reviews",
+    "prompt": "How has customer satisfaction changed over time from 2017 to 2018?",
+    "expected_keywords": ["2017", "2018", "satisfaction", "trend"],
+    "expected_numeric": true
+  },
+  {
+    "id": "delivery-01",
+    "category": "delivery",
+    "prompt": "What is the overall on-time delivery rate?",
+    "expected_keywords": ["on-time", "rate", "delivery"],
+    "expected_numeric": true
+  },
+  {
+    "id": "delivery-02",
+    "category": "delivery",
+    "prompt": "Which states have the worst delivery performance?",
+    "expected_keywords": ["state", "delay", "worst"],
+    "expected_numeric": true
+  },
+  {
+    "id": "delivery-03",
+    "category": "delivery",
+    "prompt": "What percentage of orders are delivered more than 14 days late?",
+    "expected_keywords": ["late", "percentage", "14"],
+    "expected_numeric": true
+  },
+  {
+    "id": "delivery-04",
+    "category": "delivery",
+    "prompt": "How does delivery performance in SP compare to RJ?",
+    "expected_keywords": ["SP", "RJ", "delivery"],
+    "expected_numeric": true
+  },
+  {
+    "id": "sellers-01",
+    "category": "sellers",
+    "prompt": "Who are the top 10 sellers by revenue?",
+    "expected_keywords": ["seller", "revenue", "top"],
+    "expected_numeric": true
+  },
+  {
+    "id": "sellers-02",
+    "category": "sellers",
+    "prompt": "What is the distribution of sellers across Brazilian states?",
+    "expected_keywords": ["state", "seller", "distribution"],
+    "expected_numeric": true
+  },
+  {
+    "id": "sellers-03",
+    "category": "sellers",
+    "prompt": "How do top-tier sellers differ from bottom-tier sellers in review scores?",
+    "expected_keywords": ["tier", "review", "score"],
+    "expected_numeric": true
+  }
+]

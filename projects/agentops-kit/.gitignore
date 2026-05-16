@@ -1,0 +1,32 @@
+_pptx*
+.venv
+.claude
+_ref
+_data
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+
+# Data
+data/raw/
+data/sample/*.csv
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Config
+gateway_config.json
+.env
+.rds-global-bundle.pem
+.bedrock_agentcore.yaml
+
+# OS
+.DS_Store
+
+# Evaluation results
+evaluation/results/
