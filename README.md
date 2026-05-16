@@ -1,11 +1,37 @@
-## My Project
+# Sample Agentic AI Acceleration KR
 
-TODO: Fill this README out!
+A curated archive of agentic AI code assets, sample implementations, and artifacts developed through the **Agentic AI Acceleration** program in Korea.
 
-Be sure to:
+This repository serves as a reference collection for builders looking to explore agentic AI patterns and accelerate their own development — covering everything from production-grade agent architectures to reusable Claude Code tooling.
 
-* Change the title in this README
-* Edit your repository description on GitHub
+## Repository Structure
+
+```
+.
+├── projects/    # Self-contained sample projects
+├── plugin/      # 3a-plugin — Claude Code plugin reusable across projects
+└── ...
+```
+
+## Projects
+
+Each project lives in its own folder under `projects/` with a dedicated README and setup guide.
+
+| Project | Description |
+| --- | --- |
+| [agentops-kit](./projects/agentops-kit) | An e-commerce data-analytics agent that demonstrates a full AgentOps pipeline: Gateway → Observability → Evaluation → Improvement. AWS Seoul Summit 2026 demo (AIM310). |
+
+> This table is updated whenever a new project is added.
+
+## Tooling
+
+| Tool | Description |
+| --- | --- |
+| [3a-plugin](./plugin) | A Claude Code plugin that helps you plan, track, and verify AWS-based AI agent projects. Use it as a reference companion while building. |
+
+## Contributing
+
+To add a new sample, see [CONTRIBUTING.md](CONTRIBUTING.md). Each project should be a self-contained folder with its own README and run instructions.
 
 ## Security
 
@@ -13,5 +39,4 @@ See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more inform
 
 ## License
 
-This library is licensed under the MIT-0 License. See the LICENSE file.
-
+This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.
