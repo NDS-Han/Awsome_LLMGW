@@ -19,7 +19,7 @@ Each project lives in its own folder under `projects/` with a dedicated README a
 
 | Project | Description |
 | --- | --- |
-| [agentops-kit](./projects/agentops-kit) | An e-commerce data-analytics agent that demonstrates a full AgentOps pipeline: Gateway → Observability → Evaluation → Improvement. AWS Seoul Summit 2026 demo (AIM310). |
+| [agentops-kit](./projects/agentops-kit) | An e-commerce data-analytics agent that demonstrates a full AgentOps pipeline: Gateway → Observability → Evaluation → Improvement. AWS Seoul Summit 2026 demo. |
 
 > This table is updated whenever a new project is added.
 
