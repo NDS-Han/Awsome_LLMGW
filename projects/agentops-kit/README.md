@@ -98,6 +98,19 @@ flowchart LR
 
 ---
 
+## Screenshots
+
+The dashboard surfaces every stage of the pipeline. Click any thumbnail to open the full-resolution image.
+
+| | | |
+|---|---|---|
+| <a href="./assets/chat.png"><img src="./assets/chat.png" alt="Chat" /></a><br/>**Chat** — streaming + A2A delegation | <a href="./assets/trace-1.png"><img src="./assets/trace-1.png" alt="Traces" /></a><br/>**Traces** — OTel tree, tokens, latency | <a href="./assets/metric.png"><img src="./assets/metric.png" alt="Metrics" /></a><br/>**Metrics & session health** — circuit breaker, errors |
+| <a href="./assets/llm-gateway.png"><img src="./assets/llm-gateway.png" alt="LLM Gateway" /></a><br/>**LLM Gateway** — routing, cost, guardrails | <a href="./assets/tool-analysis.png"><img src="./assets/tool-analysis.png" alt="Tool analytics" /></a><br/>**Tool analytics** — per-tool latency, failure rate | <a href="./assets/cost.png"><img src="./assets/cost.png" alt="Cost" /></a><br/>**Cost** — per-session + global, budgets |
+| <a href="./assets/eval-online.png"><img src="./assets/eval-online.png" alt="Online eval" /></a><br/>**Online eval** — sampling config, live scores | <a href="./assets/eval-batch.png"><img src="./assets/eval-batch.png" alt="Batch eval" /></a><br/>**Batch eval** — full test-suite results | <a href="./assets/opti.png"><img src="./assets/opti.png" alt="Optimization" /></a><br/>**Optimization** — recommend → bundle → A/B → apply |
+| <a href="./assets/agent-registry.png"><img src="./assets/agent-registry.png" alt="Registry" /></a><br/>**Agent & Tool Registry** — publish / approve / deprecate | <a href="./assets/team-1.png"><img src="./assets/team-1.png" alt="Teams" /></a><br/>**Teams** — usage tracking, budgets | <a href="./assets/trace-2.png"><img src="./assets/trace-2.png" alt="Trace detail" /></a><br/>**Trace detail** — span attributes, gen_ai.* fields |
+
+---
+
 ## Architecture
 
 ### AWS Services
