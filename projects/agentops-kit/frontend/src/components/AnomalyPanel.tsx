@@ -27,16 +27,8 @@ function AlarmCard({ alarm }: { alarm: AnomalyAlarm }) {
         <span style={{ fontSize: 12, fontWeight: 600, color: "var(--gray-200)" }}>
           {alarm.display_name}
         </span>
-        <span
-          style={{
-            fontSize: 10,
-            fontWeight: 700,
-            color,
-            padding: "1px 6px",
-            borderRadius: 4,
-            background: `${color}20`,
-          }}
-        >
+        <span className="badge" style={{ background: `${color}20`, color, border: `1px solid ${color}40` }}>
+          <span className={`status-dot ${alarm.state === "ALARM" ? "status-dot--error" : alarm.state === "OK" ? "status-dot--active" : "status-dot--idle"}`} />
           {alarm.state}
         </span>
       </div>
@@ -138,8 +130,9 @@ export default function AnomalyPanel({ compact }: { compact?: boolean }) {
           <AlertTriangle size={14} />
           이상 탐지
         </div>
-        <span style={{ fontSize: 11, color: alarmCount > 0 ? "#ef4444" : "var(--gray-500)" }}>
-          {alarmCount > 0 ? `알람 ${alarmCount}건 활성` : "모두 정상"}
+        <span className={`badge ${alarmCount > 0 ? "badge--danger" : "badge--success"}`}>
+          <span className={`status-dot ${alarmCount > 0 ? "status-dot--error status-dot--pulse" : "status-dot--active"}`} />
+          {alarmCount > 0 ? `알람 ${alarmCount}건` : "정상"}
         </span>
       </div>
       <div className="panel-body">

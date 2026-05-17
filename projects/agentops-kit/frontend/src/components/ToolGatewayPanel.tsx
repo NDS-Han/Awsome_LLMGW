@@ -74,9 +74,10 @@ export default function ToolGatewayPanel({ compact }: { compact?: boolean }) {
     <div className="panel">
       <div className="panel-header">
         <div className="panel-title"><Wrench size={14}/>Tool Gateway</div>
-        <span style={{fontSize:11,color:"var(--gray-500)"}}>
-          도구 {state.tool_count}개 · 인증: {state.authorizer}
-        </span>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <span className="badge badge--neutral badge--mono">{state.tool_count}개 도구</span>
+          <span className="badge badge--info">{state.authorizer}</span>
+        </div>
       </div>
       <div className="panel-body">
         {state.error && (
@@ -111,8 +112,9 @@ export default function ToolGatewayPanel({ compact }: { compact?: boolean }) {
         </div>
 
         {/* 도구 목록 */}
-        <div style={{fontSize:11,color:"var(--gray-400)",marginBottom:6,textTransform:"uppercase",letterSpacing:0.5}}>
-          등록된 도구 ({state.tools.length}개)
+        <div className="section-block__title">
+          <Wrench size={10} />
+          <span>등록된 도구 ({state.tools.length}개)</span>
         </div>
         <div style={{display:"flex",flexDirection:"column",gap:8}}>
           {state.tools.map(t => {
@@ -131,19 +133,18 @@ export default function ToolGatewayPanel({ compact }: { compact?: boolean }) {
                   borderRadius:"var(--radius)",
               }}>
                 <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4,gap:6}}>
-                  <span style={{fontSize:12,fontWeight:600,color:"var(--amber)",fontFamily:"'JetBrains Mono',monospace"}}>
-                    {t.name}
-                  </span>
+                  <div style={{display:"flex",alignItems:"center",gap:6}}>
+                    <span className={`status-dot ${calls > 0 ? "status-dot--active" : "status-dot--idle"}`} />
+                    <span style={{fontSize:12,fontWeight:600,color:"var(--amber)",fontFamily:"'JetBrains Mono',monospace"}}>
+                      {t.name}
+                    </span>
+                  </div>
                   <div style={{display:"flex",alignItems:"center",gap:6}}>
                     {delta != null && (
-                      <span className="slide-in" style={{fontSize:10,padding:"2px 6px",background:"var(--green)",borderRadius:10,color:"#fff",fontWeight:700}}>
-                        +{delta}
-                      </span>
+                      <span className="badge badge--success">+{delta}</span>
                     )}
                     {calls > 0 && (
-                      <span style={{fontSize:10,padding:"2px 8px",background:"var(--navy-light)",borderRadius:10,color:"var(--green-light)"}}>
-                        호출 {calls}회
-                      </span>
+                      <span className="badge badge--neutral badge--mono">호출 {calls}회</span>
                     )}
                   </div>
                 </div>
@@ -153,14 +154,7 @@ export default function ToolGatewayPanel({ compact }: { compact?: boolean }) {
                 {t.schema?.properties && (
                   <div style={{display:"flex",flexWrap:"wrap",gap:4,marginTop:4}}>
                     {Object.entries(t.schema.properties).slice(0,6).map(([k,v]: any)=>(
-                      <span key={k} style={{
-                        fontSize:10,
-                        padding:"1px 6px",
-                        background:"var(--navy)",
-                        borderRadius:3,
-                        fontFamily:"'JetBrains Mono',monospace",
-                        color:"var(--gray-400)",
-                      }}>
+                      <span key={k} className="badge badge--neutral badge--mono">
                         {k}: {v?.type || "any"}
                       </span>
                     ))}

@@ -1,13 +1,28 @@
 import { useEffect, useState } from "react";
 import { Users, ArrowRight, Network } from "lucide-react";
 import { api } from "../api";
-import { AgentGatewayState } from "../types";
+import { AgentGatewayAgent, AgentGatewayState } from "../types";
 
 const ROLE_COLORS: Record<string, string> = {
   main: "var(--amber)",
   reviews: "var(--blue-light)",
   logistics: "var(--green-light)",
 };
+
+const SPECIALIST_PALETTE = [
+  "var(--blue-light)",
+  "var(--green-light)",
+  "var(--amber-light)",
+  "var(--red-light)",
+];
+
+function colorForRole(role: string, specialistIndex = 0): string {
+  return ROLE_COLORS[role] || SPECIALIST_PALETTE[specialistIndex % SPECIALIST_PALETTE.length];
+}
+
+function titleCase(role: string): string {
+  return role.charAt(0).toUpperCase() + role.slice(1);
+}
 
 export default function AgentGatewayPanel({ compact }: { compact?: boolean }) {
   const [state, setState] = useState<AgentGatewayState | null>(null);
@@ -56,9 +71,10 @@ export default function AgentGatewayPanel({ compact }: { compact?: boolean }) {
     <div className="panel">
       <div className="panel-header">
         <div className="panel-title"><Users size={14}/>Agent Gateway</div>
-        <span style={{fontSize:11,color:"var(--gray-500)"}}>
-          에이전트 {state.agent_count}개 · 핸드오프 {state.handoff_count}회
-        </span>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <span className="badge badge--neutral badge--mono">{state.agent_count}개</span>
+          <span className="badge badge--info badge--mono">핸드오프 {state.handoff_count}</span>
+        </div>
       </div>
       <div className="panel-body">
         {state.error && (
@@ -86,8 +102,9 @@ export default function AgentGatewayPanel({ compact }: { compact?: boolean }) {
         </div>
 
         {/* 등록된 에이전트 */}
-        <div style={{fontSize:11,color:"var(--gray-400)",marginBottom:6,textTransform:"uppercase",letterSpacing:0.5}}>
-          등록된 에이전트
+        <div className="section-block__title">
+          <Users size={10} />
+          <span>등록된 에이전트</span>
         </div>
         <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:16}}>
           {state.agents.map(a => (
@@ -99,47 +116,46 @@ export default function AgentGatewayPanel({ compact }: { compact?: boolean }) {
               borderRadius:"var(--radius)",
             }}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:2}}>
-                <span style={{fontSize:12,fontWeight:600,color:"var(--gray-100)"}}>
-                  {a.name}
-                </span>
-                <span style={{
-                  fontSize:10,
-                  padding:"2px 8px",
-                  background:"var(--navy)",
-                  borderRadius:10,
-                  color:ROLE_COLORS[a.role] || "var(--gray-400)",
-                  fontWeight:600,
-                  textTransform:"uppercase",
-                }}>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span className={`status-dot ${a.status==="READY" ? "status-dot--active" : "status-dot--warning"}`} />
+                  <span style={{fontSize:12,fontWeight:600,color:"var(--gray-100)"}}>
+                    {a.name}
+                  </span>
+                </div>
+                <span className="badge" style={{background:`${ROLE_COLORS[a.role] || "var(--gray-500)"}20`,color:ROLE_COLORS[a.role] || "var(--gray-400)",border:`1px solid ${ROLE_COLORS[a.role] || "var(--gray-500)"}40`}}>
                   {a.role}
                 </span>
               </div>
               <div style={{fontSize:11,color:"var(--gray-400)",marginBottom:4}}>
                 {a.description}
               </div>
-              <div style={{fontSize:10,fontFamily:"'JetBrains Mono',monospace",color:"var(--gray-500)",display:"flex",justifyContent:"space-between"}}>
-                <span style={{overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{a.arn}</span>
-                <span style={{color:a.status==="READY"?"var(--green-light)":"var(--amber)",marginLeft:8}}>
-                  {a.status}
-                </span>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginTop:4}}>
+                <span className="badge badge--neutral badge--mono" style={{maxWidth:"70%",overflow:"hidden",textOverflow:"ellipsis"}}>{a.arn}</span>
+                <span className={`badge ${a.status==="READY"?"badge--success":"badge--warning"}`}>{a.status}</span>
               </div>
             </div>
           ))}
         </div>
 
         {/* A2A 호출 그래프 (SVG edges + flow animation) */}
-        {state.agents.length >= 3 && (
+        {state.agents.length >= 2 && (
           <>
-            <div style={{fontSize:11,color:"var(--gray-400)",marginBottom:6,textTransform:"uppercase",letterSpacing:0.5}}>
-              위임 그래프
+            <div className="divider" />
+            <div className="section-block__title">
+              <Network size={10} />
+              <span>위임 그래프</span>
             </div>
-            <DelegationGraph lastTarget={state.last_handoff?.to || null} />
+            <DelegationGraph
+              agents={state.agents}
+              lastTarget={state.last_handoff?.to || null}
+            />
           </>
         )}
 
         {/* 최근 handoff */}
-        <div style={{fontSize:11,color:"var(--gray-400)",marginBottom:6,textTransform:"uppercase",letterSpacing:0.5}}>
-          최근 핸드오프
+        <div className="section-block__title">
+          <ArrowRight size={10} />
+          <span>최근 핸드오프</span>
         </div>
         {state.handoffs.length === 0 ? (
           <div style={{fontSize:11,color:"var(--gray-500)",padding:10}}>
@@ -176,8 +192,7 @@ export default function AgentGatewayPanel({ compact }: { compact?: boolean }) {
   );
 }
 
-function AgentNode({ role, label, compact }: { role: string; label: string; compact?: boolean }) {
-  const color = ROLE_COLORS[role] || "var(--gray-500)";
+function AgentNode({ color, label, compact }: { color: string; label: string; compact?: boolean }) {
   return (
     <div style={{
       padding: compact ? "6px 10px" : "10px 14px",
@@ -197,17 +212,54 @@ function AgentNode({ role, label, compact }: { role: string; label: string; comp
   );
 }
 
-function DelegationGraph({ lastTarget }: { lastTarget: string | null }) {
+function DelegationGraph({
+  agents,
+  lastTarget,
+}: {
+  agents: AgentGatewayAgent[];
+  lastTarget: string | null;
+}) {
+  const main = agents.find(a => a.role === "main") || agents[0];
+  const specialists = agents.filter(a => a !== main);
+  if (!main || specialists.length === 0) return null;
+
+  const NODE_W = 92;
+  const NODE_HALF = NODE_W / 2;
   const W = 360;
-  const H = 120;
-  const MAIN = { x: 70, y: H / 2 };
-  const REVIEWS = { x: 290, y: 30 };
-  const LOGISTICS = { x: 290, y: 90 };
+  const ROW_H = 56; // specialist 노드 한 줄 높이
+  const MIN_H = 120;
+  const H = Math.max(MIN_H, specialists.length * ROW_H + 32);
+
+  const mainPoint = { x: 60, y: H / 2 };
+  const specialistX = W - 60;
+  // 우측에 균등 배치
+  const specialistPoints = specialists.map((_, i) => {
+    if (specialists.length === 1) return { x: specialistX, y: H / 2 };
+    const top = 24;
+    const bottom = H - 24;
+    const t = i / (specialists.length - 1);
+    return { x: specialistX, y: top + (bottom - top) * t };
+  });
+
   const amber = "var(--amber-light)";
   const dim = "var(--navy-lighter)";
-  const reviewsActive = lastTarget === "reviews";
-  const logisticsActive = lastTarget === "logistics";
-  const anyActive = reviewsActive || logisticsActive;
+
+  // 선의 시작/끝을 노드 가장자리로 자르기 위해 단위 벡터로 보정
+  const trim = (from: {x:number;y:number}, to: {x:number;y:number}, padFrom: number, padTo: number) => {
+    const dx = to.x - from.x;
+    const dy = to.y - from.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const ux = dx / len;
+    const uy = dy / len;
+    return {
+      x1: from.x + ux * padFrom,
+      y1: from.y + uy * padFrom,
+      x2: to.x - ux * padTo,
+      y2: to.y - uy * padTo,
+    };
+  };
+
+  const activeSpecialist = specialists.find(a => a.role === lastTarget || a.name === lastTarget);
 
   return (
     <div style={{
@@ -216,48 +268,61 @@ function DelegationGraph({ lastTarget }: { lastTarget: string | null }) {
       border:"1px solid var(--navy-light)",
       borderRadius:"var(--radius)",
       marginBottom:16,
-      position:"relative",
       display:"flex",
-      alignItems:"center",
       justifyContent:"center",
     }}>
-      <svg width={W} height={H} style={{overflow:"visible"}}>
-        {/* main → reviews */}
-        <line
-          x1={MAIN.x + 40} y1={MAIN.y} x2={REVIEWS.x - 40} y2={REVIEWS.y}
-          stroke={reviewsActive ? amber : dim}
-          strokeWidth={reviewsActive ? 2.5 : 1.5}
-          className={reviewsActive ? "flow-edge" : ""}
-        />
-        {/* main → logistics */}
-        <line
-          x1={MAIN.x + 40} y1={MAIN.y} x2={LOGISTICS.x - 40} y2={LOGISTICS.y}
-          stroke={logisticsActive ? amber : dim}
-          strokeWidth={logisticsActive ? 2.5 : 1.5}
-          className={logisticsActive ? "flow-edge" : ""}
-        />
-      </svg>
-      <div style={{position:"absolute",left:12 + MAIN.x - 46,top:12 + MAIN.y - 26}}>
-        <AgentNode role="main" label="Main" compact/>
+      <div style={{position:"relative",width:W,height:H}}>
+        <svg width={W} height={H} style={{position:"absolute",inset:0,overflow:"visible"}}>
+          {specialists.map((agent, i) => {
+            const active = agent === activeSpecialist;
+            const line = trim(mainPoint, specialistPoints[i], NODE_HALF, NODE_HALF);
+            return (
+              <line
+                key={agent.arn || agent.name}
+                x1={line.x1} y1={line.y1} x2={line.x2} y2={line.y2}
+                stroke={active ? amber : dim}
+                strokeWidth={active ? 2.5 : 1.5}
+                className={active ? "flow-edge" : ""}
+              />
+            );
+          })}
+        </svg>
+        <NodePin x={mainPoint.x} y={mainPoint.y} color={colorForRole(main.role)} label={titleCase(main.role || main.name)} />
+        {specialists.map((agent, i) => (
+          <NodePin
+            key={agent.arn || agent.name}
+            x={specialistPoints[i].x}
+            y={specialistPoints[i].y}
+            color={colorForRole(agent.role, i)}
+            label={titleCase(agent.role || agent.name)}
+          />
+        ))}
+        {activeSpecialist && (
+          <div style={{
+            position:"absolute",
+            right:0,
+            bottom:-4,
+            fontSize:10,
+            color:"var(--amber-light)",
+            fontFamily:"'JetBrains Mono',monospace",
+          }}>
+            ▸ {main.role || main.name} → {activeSpecialist.role || activeSpecialist.name}
+          </div>
+        )}
       </div>
-      <div style={{position:"absolute",left:12 + REVIEWS.x - 46,top:12 + REVIEWS.y - 20}}>
-        <AgentNode role="reviews" label="Reviews" compact/>
-      </div>
-      <div style={{position:"absolute",left:12 + LOGISTICS.x - 46,top:12 + LOGISTICS.y - 20}}>
-        <AgentNode role="logistics" label="Logistics" compact/>
-      </div>
-      {anyActive && (
-        <div style={{
-          position:"absolute",
-          right:10,
-          bottom:8,
-          fontSize:10,
-          color:"var(--amber-light)",
-          fontFamily:"'JetBrains Mono',monospace",
-        }}>
-          ▸ main → {lastTarget}
-        </div>
-      )}
+    </div>
+  );
+}
+
+function NodePin({ x, y, color, label }: { x: number; y: number; color: string; label: string }) {
+  return (
+    <div style={{
+      position:"absolute",
+      left:x,
+      top:y,
+      transform:"translate(-50%, -50%)",
+    }}>
+      <AgentNode color={color} label={label} compact />
     </div>
   );
 }

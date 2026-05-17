@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   AgentOps E-commerce Analytics Demo — Aurora PostgreSQL Serverless v2
-  (AIM310, AWS Seoul Summit 2026).
+  (AWS Seoul Summit 2026).
   Provisions a single-instance Aurora cluster in the default VPC with a public
   endpoint (CIDR-restricted) and credentials stored in Secrets Manager.
 
@@ -310,6 +310,97 @@ Resources:
         - {AttributeName: entity_id, KeyType: HASH}
         - {AttributeName: period, KeyType: RANGE}
 
+  # --- DynamoDB: Persistence Layer (in-memory state migration) ---
+
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-chat-history"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      AttributeDefinitions:
+        - {AttributeName: session_id, AttributeType: S}
+        - {AttributeName: sort_key, AttributeType: S}
+        - {AttributeName: date_bucket, AttributeType: S}
+        - {AttributeName: timestamp, AttributeType: S}
+      KeySchema:
+        - {AttributeName: session_id, KeyType: HASH}
+        - {AttributeName: sort_key, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-timestamp
+          KeySchema:
+            - {AttributeName: date_bucket, KeyType: HASH}
+            - {AttributeName: timestamp, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  EvaluationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-evaluations"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      AttributeDefinitions:
+        - {AttributeName: turn_id, AttributeType: S}
+        - {AttributeName: sort_key, AttributeType: S}
+        - {AttributeName: date_bucket, AttributeType: S}
+        - {AttributeName: timestamp, AttributeType: S}
+      KeySchema:
+        - {AttributeName: turn_id, KeyType: HASH}
+        - {AttributeName: sort_key, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-timestamp
+          KeySchema:
+            - {AttributeName: date_bucket, KeyType: HASH}
+            - {AttributeName: timestamp, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-sessions"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      AttributeDefinitions:
+        - {AttributeName: session_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: session_id, KeyType: HASH}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  AnalyticsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /agentops/analytics
+      RetentionInDays: 14
+
 Outputs:
   ClusterArn:
     Description: Aurora cluster ARN (required for RDS Data API).
@@ -338,3 +429,19 @@ Outputs:
   BudgetStateTableName:
     Description: DynamoDB table for budget counters.
     Value: !Ref BudgetStateTable
+
+  ChatHistoryTableName:
+    Description: DynamoDB table for chat history persistence.
+    Value: !Ref ChatHistoryTable
+
+  EvaluationsTableName:
+    Description: DynamoDB table for evaluation results.
+    Value: !Ref EvaluationsTable
+
+  SessionsTableName:
+    Description: DynamoDB table for session state.
+    Value: !Ref SessionsTable
+
+  AnalyticsLogGroupName:
+    Description: CloudWatch Log Group for analytics events.
+    Value: !Ref AnalyticsLogGroup

@@ -233,6 +233,21 @@ class Events:
 _queue = AnalyticsQueue()
 _memory_sink = InMemorySink(max_events=1000)
 _queue.add_sink(_memory_sink)
+_cw_sink_registered = False
+
+
+def _ensure_cw_sink():
+    """Lazily register CloudWatch Logs sink (avoids circular import)."""
+    global _cw_sink_registered
+    if _cw_sink_registered:
+        return
+    _cw_sink_registered = True
+    try:
+        from api.cw_logs_sink import CloudWatchLogsSink
+        _cw_sink = CloudWatchLogsSink()
+        _queue.add_sink(_cw_sink)
+    except Exception as e:
+        print(f"[analytics] CloudWatch Logs sink init failed (non-critical): {e}")
 
 
 def get_queue() -> AnalyticsQueue:

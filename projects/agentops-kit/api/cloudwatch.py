@@ -47,14 +47,15 @@ class CloudWatchHelper:
         self._otel_batch_cache: dict[str, list[dict]] = {}
         self._otel_trace_meta_cache: dict[str, dict] = {}
         self._otel_batch_ts: float = 0
+        self._otel_batch_hours: int = 0
 
     # ------------------------------------------------------------------
     # Public: trace list
     # ------------------------------------------------------------------
 
-    def get_recent_traces(self, limit: int = 20) -> list[dict]:
+    def get_recent_traces(self, limit: int = 20, hours: int = 6) -> list[dict]:
         """최근 트레이스 목록 (OTEL spans)."""
-        otel_batch = self.get_otel_spans_batch()
+        otel_batch = self.get_otel_spans_batch(hours=hours)
 
         traces = []
         for otel_tid, spans in otel_batch.items():
@@ -195,18 +196,12 @@ class CloudWatchHelper:
         """aws/spans + runtime 로그에서 traceId로 OTEL spans + event logs 조회."""
         otel_hex = _to_otel_hex(trace_id)
 
-        if self._otel_batch_cache and (
-            time.time() - self._otel_batch_ts
-        ) < self._BATCH_CACHE_TTL_S:
-            cached = self._otel_batch_cache.get(otel_hex)
-            if cached:
-                return cached
         try:
             query = f"fields @message | filter @message like /{otel_hex}/ | limit 100"
             raw_spans = self._query_log_group(OTEL_SPANS_LOG_GROUP, query)
 
             if RUNTIME_LOG_GROUP:
-                event_query = f"fields @message | filter @message like /{otel_hex}/ and @message like /gen_ai.system/ | limit 100"
+                event_query = f"fields @message | filter @message like /{otel_hex}/ | limit 200"
                 event_logs = self._query_log_group(RUNTIME_LOG_GROUP, event_query)
                 raw_spans.extend(event_logs)
 
@@ -229,9 +224,11 @@ class CloudWatchHelper:
     def get_otel_spans_batch(self, hours: int = 6) -> dict[str, list[dict]]:
         """aws/spans에서 최근 스팬을 일괄 조회하여 traceId별로 그룹. TTL 캐시."""
         now = time.time()
-        if self._otel_batch_cache and (
-            now - self._otel_batch_ts
-        ) < self._BATCH_CACHE_TTL_S:
+        if (
+            self._otel_batch_cache
+            and (now - self._otel_batch_ts) < self._BATCH_CACHE_TTL_S
+            and self._otel_batch_hours == hours
+        ):
             return self._otel_batch_cache
 
         try:
@@ -309,6 +306,7 @@ class CloudWatchHelper:
             self._otel_batch_cache = grouped
             self._otel_trace_meta_cache = trace_meta
             self._otel_batch_ts = now
+            self._otel_batch_hours = hours
             return grouped
         except (ClientError, Exception):
             return {}
@@ -416,29 +414,7 @@ class CloudWatchHelper:
             ts_ms = round((ts_nano - trace_start_nano) / 1_000_000, 1) if trace_start_nano else 0
 
             body = ev.get("body", {})
-            if isinstance(body, dict):
-                content = body.get("content", "")
-                if isinstance(content, list):
-                    parts = []
-                    for item in content:
-                        if isinstance(item, dict):
-                            parts.append(item.get("text", json.dumps(item, ensure_ascii=False)))
-                        else:
-                            parts.append(str(item))
-                    body_text = "\n".join(parts)
-                elif content:
-                    body_text = str(content)
-                else:
-                    tool_calls = body.get("tool_calls", [])
-                    tool_result = body.get("toolResult", {})
-                    if tool_calls:
-                        body_text = json.dumps(tool_calls, ensure_ascii=False)[:2000]
-                    elif tool_result:
-                        body_text = json.dumps(tool_result, ensure_ascii=False)[:2000]
-                    else:
-                        body_text = json.dumps(body, ensure_ascii=False)[:2000] if body else ""
-            else:
-                body_text = str(body)[:2000] if body else ""
+            body_text = self._extract_event_body_text(body)
 
             ev_attrs = ev.get("attributes", {})
             scope = ev.get("scope", {})
@@ -486,15 +462,7 @@ class CloudWatchHelper:
                 for a in attrs_raw:
                     k = a.get("key", "")
                     v = a.get("value", {})
-                    if isinstance(v, dict):
-                        attrs[k] = (
-                            v.get("stringValue")
-                            or v.get("intValue")
-                            or v.get("doubleValue")
-                            or v.get("boolValue", "")
-                        )
-                    else:
-                        attrs[k] = v
+                    attrs[k] = self._extract_otel_attr_value(v)
             else:
                 attrs = dict(attrs_raw)
 
@@ -597,13 +565,130 @@ class CloudWatchHelper:
     @staticmethod
     def _extract_otel_attr_value(v):
         if isinstance(v, dict):
-            return (
-                v.get("stringValue")
-                or v.get("intValue")
-                or v.get("doubleValue")
-                or v.get("boolValue", "")
-            )
+            if "stringValue" in v:
+                return v["stringValue"]
+            if "intValue" in v:
+                return v["intValue"]
+            if "doubleValue" in v:
+                return v["doubleValue"]
+            if "boolValue" in v:
+                return v["boolValue"]
+            if "arrayValue" in v:
+                arr = v["arrayValue"]
+                if isinstance(arr, dict):
+                    values = arr.get("values", [])
+                    return json.dumps([CloudWatchHelper._extract_otel_attr_value(item) for item in values], ensure_ascii=False)
+                return json.dumps(arr, ensure_ascii=False)
+            if "kvlistValue" in v:
+                kv = v["kvlistValue"]
+                if isinstance(kv, dict):
+                    pairs = kv.get("values", [])
+                    obj = {}
+                    for pair in pairs:
+                        if isinstance(pair, dict):
+                            obj[pair.get("key", "")] = CloudWatchHelper._extract_otel_attr_value(pair.get("value", ""))
+                    return json.dumps(obj, ensure_ascii=False)
+                return json.dumps(kv, ensure_ascii=False)
+            if "bytesValue" in v:
+                return v["bytesValue"]
+            return json.dumps(v, ensure_ascii=False)
         return v
+
+    @staticmethod
+    def _deep_decode_json_str(s: str) -> str:
+        """중첩된 JSON 문자열을 재귀적으로 풀어서 유니코드를 복원."""
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, dict):
+                if "body" in parsed and isinstance(parsed["body"], str):
+                    parsed["body"] = CloudWatchHelper._deep_decode_json_str(parsed["body"])
+                return json.dumps(parsed, ensure_ascii=False)
+            elif isinstance(parsed, str):
+                return CloudWatchHelper._deep_decode_json_str(parsed)
+            return json.dumps(parsed, ensure_ascii=False)
+        except (json.JSONDecodeError, TypeError, RecursionError):
+            return s
+
+    @staticmethod
+    def _decode_content_str(s: str) -> str:
+        """JSON 문자열로 인코딩된 content를 디코딩하여 읽기 좋은 텍스트로 변환."""
+        try:
+            parsed = json.loads(s)
+            if isinstance(parsed, list):
+                parts = []
+                for item in parsed:
+                    if isinstance(item, dict):
+                        if "text" in item:
+                            parts.append(item["text"])
+                        elif "toolUse" in item:
+                            tu = item["toolUse"]
+                            parts.append(json.dumps({"toolUse": {"name": tu.get("name"), "input": tu.get("input"), "toolUseId": tu.get("toolUseId")}}, ensure_ascii=False))
+                        elif "toolResult" in item:
+                            tr = item["toolResult"]
+                            result_text = ""
+                            for c in tr.get("content", []):
+                                if isinstance(c, dict) and "text" in c:
+                                    result_text = CloudWatchHelper._deep_decode_json_str(c["text"])
+                            parts.append(json.dumps({"toolResult": {"toolUseId": tr.get("toolUseId"), "status": tr.get("status"), "content": result_text[:1500]}}, ensure_ascii=False))
+                        else:
+                            parts.append(json.dumps(item, ensure_ascii=False))
+                    else:
+                        parts.append(str(item))
+                return "\n".join(parts)
+            return s
+        except (json.JSONDecodeError, TypeError):
+            return s
+
+    @staticmethod
+    def _extract_event_body_text(body) -> str:
+        """Event log body를 읽기 좋은 텍스트로 변환."""
+        if not body:
+            return ""
+        if not isinstance(body, dict):
+            return str(body)[:4000]
+
+        # output/input messages 구조 (runtime event log)
+        output_msgs = body.get("output", {}).get("messages", [])
+        input_msgs = body.get("input", {}).get("messages", [])
+        if output_msgs or input_msgs:
+            parts = []
+            for msg in input_msgs:
+                role = msg.get("role", "user")
+                raw_content = msg.get("content", {}).get("content", "") if isinstance(msg.get("content"), dict) else str(msg.get("content", ""))
+                decoded = CloudWatchHelper._decode_content_str(raw_content) if raw_content else ""
+                if decoded:
+                    parts.append(f"[{role}] {decoded}")
+            for msg in output_msgs:
+                role = msg.get("role", "assistant")
+                raw_content = msg.get("content", {}).get("content", "") if isinstance(msg.get("content"), dict) else str(msg.get("content", ""))
+                decoded = CloudWatchHelper._decode_content_str(raw_content) if raw_content else ""
+                if decoded:
+                    parts.append(f"[{role}] {decoded}")
+            if parts:
+                return "\n".join(parts)[:4000]
+
+        # content list 구조 (inline span events)
+        content = body.get("content", "")
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(item.get("text", json.dumps(item, ensure_ascii=False)))
+                else:
+                    parts.append(str(item))
+            return "\n".join(parts)[:4000]
+        elif content:
+            return str(content)[:4000]
+
+        # toolResult / tool_calls
+        tool_result = body.get("toolResult", {})
+        if tool_result:
+            return json.dumps(tool_result, ensure_ascii=False)[:4000]
+        tool_calls = body.get("tool_calls", [])
+        if tool_calls:
+            return json.dumps(tool_calls, ensure_ascii=False)[:4000]
+
+        return json.dumps(body, ensure_ascii=False)[:4000]
 
     @staticmethod
     def _parse_otel_events(raw_events: list, trace_start_nano: int) -> list[dict]:
@@ -858,12 +943,27 @@ class CloudWatchHelper:
             pts = results_map.get(key, [])
             return pts[-1]["value"] if pts else default
 
+        def _avg_of(key, default=0):
+            pts = results_map.get(key, [])
+            return sum(p["value"] for p in pts) / len(pts) if pts else default
+
         def _sum_of(key):
             return sum(p["value"] for p in results_map.get(key, []))
 
         invocation_count = int(_sum_of("invocations"))
         total_input = int(_sum_of("token_input"))
         total_output = int(_sum_of("token_output"))
+
+        # Fallback: OTEL 메트릭이 없으면 span 로그에서 토큰 추출
+        token_source = "cloudwatch"
+        avg_llm_duration_from_spans = 0.0
+        if total_input == 0 and total_output == 0:
+            span_tokens = self._get_token_usage_from_spans(hours)
+            total_input = span_tokens.get("input", 0)
+            total_output = span_tokens.get("output", 0)
+            avg_llm_duration_from_spans = span_tokens.get("avg_llm_duration_ms", 0.0)
+            if total_input or total_output:
+                token_source = "otel_spans"
 
         tool_calls = self._get_tool_call_metrics(start_time, end_time, period)
         tool_durations = self._get_tool_duration_metrics(start_time, end_time, period)
@@ -883,9 +983,12 @@ class CloudWatchHelper:
         total_errors = int(_sum_of("errors"))
         error_rate = round(total_errors / max(invocation_count, 1) * 100, 1)
 
-        avg_llm_duration = round(_last_or("llm_duration"), 1)
-        avg_total_latency = round(_last_or("latency_avg"), 1)
-        llm_ratio = round(avg_llm_duration / max(avg_total_latency, 1) * 100, 1) if avg_total_latency > 0 else 0
+        # gen_ai.client.operation.duration is in seconds; convert to ms
+        avg_llm_duration = round(_avg_of("llm_duration") * 1000, 1)
+        if avg_llm_duration == 0 and avg_llm_duration_from_spans > 0:
+            avg_llm_duration = round(avg_llm_duration_from_spans, 1)
+        avg_total_latency = round(_avg_of("latency_avg"), 1)
+        llm_ratio = min(round(avg_llm_duration / max(avg_total_latency, 1) * 100, 1), 100.0) if avg_total_latency > 0 else 0
 
         return {
             "invocation_count": invocation_count,
@@ -920,7 +1023,7 @@ class CloudWatchHelper:
                 "avg_total_ms": avg_total_latency,
                 "avg_llm_ms": avg_llm_duration,
                 "llm_ratio_pct": llm_ratio,
-                "avg_duration_ms": round(_last_or("duration_avg"), 1),
+                "avg_duration_ms": round(_avg_of("duration_avg"), 1),
                 "values": results_map.get("duration_avg", [])[-20:],
             },
             "compute": {
@@ -930,8 +1033,45 @@ class CloudWatchHelper:
             "event_loop": event_loop,
             "tool_calls": tool_calls,
             "tool_durations": tool_durations,
+            "token_source": token_source,
             "source": "cloudwatch",
         }
+
+    def _get_token_usage_from_spans(self, hours: int) -> dict:
+        """OTEL span 로그에서 토큰 사용량과 LLM duration을 집계 (CW 메트릭 fallback)."""
+        try:
+            query = (
+                "fields @message"
+                " | filter @message like /gen_ai.usage/"
+                " | limit 200"
+            )
+            raw_spans = self._query_log_group(OTEL_SPANS_LOG_GROUP, query, hours=hours)
+            if not raw_spans:
+                batch = self.get_otel_spans_batch(hours=hours)
+                all_spans = [s for spans in batch.values() for s in spans]
+            else:
+                all_spans = self._normalize_otel_spans(raw_spans)
+
+            total_input = 0
+            total_output = 0
+            llm_durations: list[float] = []
+
+            for s in all_spans:
+                if not isinstance(s, dict):
+                    continue
+                attrs = s.get("attributes", {})
+                inp = int(attrs.get("gen_ai.usage.input_tokens", 0) or 0)
+                out = int(attrs.get("gen_ai.usage.output_tokens", 0) or 0)
+                if inp or out:
+                    total_input += inp
+                    total_output += out
+                if s.get("type") == "llm" and s.get("duration_ms", 0) > 0:
+                    llm_durations.append(s["duration_ms"])
+
+            avg_llm = sum(llm_durations) / len(llm_durations) if llm_durations else 0.0
+            return {"input": total_input, "output": total_output, "avg_llm_duration_ms": avg_llm}
+        except Exception:
+            return {"input": 0, "output": 0, "avg_llm_duration_ms": 0.0}
 
     def _get_account_id(self) -> str:
         if not hasattr(self, "_account_id"):
@@ -942,35 +1082,32 @@ class CloudWatchHelper:
     def _get_tool_call_metrics(
         self, start_time: datetime, end_time: datetime, period: int
     ) -> dict[str, int]:
-        """bedrock-agentcore에서 strands.tool.call_count를 tool_name별로 집계."""
+        """bedrock-agentcore에서 strands.tool.call_count를 tool_name별로 집계.
+
+        tool_use_id가 dimension에 포함되어 호출마다 새 시리즈가 생기므로,
+        모든 시리즈를 조회한 뒤 tool_name 기준으로 합산한다.
+        """
         try:
             paginator = self.cw_client.get_paginator("list_metrics")
-            tool_dims_list = []
+            all_dims_list: list[tuple[str, list]] = []
             for page in paginator.paginate(
                 Namespace=OTEL_NS, MetricName="strands.tool.call_count"
             ):
                 for m in page.get("Metrics", []):
                     dims = {d["Name"]: d["Value"] for d in m.get("Dimensions", [])}
                     if "tool_name" in dims:
-                        tool_dims_list.append(m["Dimensions"])
+                        raw_name = dims["tool_name"]
+                        short_name = raw_name.split("___")[-1] if "___" in raw_name else raw_name
+                        all_dims_list.append((short_name, m["Dimensions"]))
 
-            if not tool_dims_list:
+            if not all_dims_list:
                 return {}
-
-            seen_tools: set[str] = set()
-            unique_dims = []
-            for dims in tool_dims_list:
-                tool_name = next(d["Value"] for d in dims if d["Name"] == "tool_name")
-                if tool_name not in seen_tools:
-                    seen_tools.add(tool_name)
-                    unique_dims.append(dims)
 
             queries = []
             tool_id_map: dict[str, str] = {}
-            for i, dims in enumerate(unique_dims):
-                tool_name = next(d["Value"] for d in dims if d["Name"] == "tool_name")
+            for i, (short_name, dims) in enumerate(all_dims_list):
                 qid = f"tool_{i}"
-                tool_id_map[qid] = tool_name.split("___")[-1] if "___" in tool_name else tool_name
+                tool_id_map[qid] = short_name
                 queries.append({
                     "Id": qid,
                     "MetricStat": {
@@ -1001,30 +1138,31 @@ class CloudWatchHelper:
     def _get_tool_duration_metrics(
         self, start_time: datetime, end_time: datetime, period: int
     ) -> dict[str, float]:
-        """bedrock-agentcore에서 strands.tool.duration을 tool_name별로 집계 (평균 ms)."""
+        """bedrock-agentcore에서 strands.tool.duration을 tool_name별로 집계 (평균 ms).
+
+        tool_use_id dimension으로 시리즈가 분산되므로 모든 시리즈를 조회 후 tool_name별 평균.
+        """
         try:
             paginator = self.cw_client.get_paginator("list_metrics")
-            seen_tools: set[str] = set()
-            unique_dims = []
+            all_dims_list: list[tuple[str, list]] = []
             for page in paginator.paginate(
                 Namespace=OTEL_NS, MetricName="strands.tool.duration"
             ):
                 for m in page.get("Metrics", []):
                     dims = {d["Name"]: d["Value"] for d in m.get("Dimensions", [])}
                     tool_name = dims.get("tool_name", "")
-                    if tool_name and tool_name not in seen_tools:
-                        seen_tools.add(tool_name)
-                        unique_dims.append(m["Dimensions"])
+                    if tool_name:
+                        short_name = tool_name.split("___")[-1] if "___" in tool_name else tool_name
+                        all_dims_list.append((short_name, m["Dimensions"]))
 
-            if not unique_dims:
+            if not all_dims_list:
                 return {}
 
             queries = []
             tool_id_map: dict[str, str] = {}
-            for i, dims in enumerate(unique_dims):
-                tool_name = next(d["Value"] for d in dims if d["Name"] == "tool_name")
+            for i, (short_name, dims) in enumerate(all_dims_list):
                 qid = f"td_{i}"
-                tool_id_map[qid] = tool_name.split("___")[-1] if "___" in tool_name else tool_name
+                tool_id_map[qid] = short_name
                 queries.append({
                     "Id": qid,
                     "MetricStat": {

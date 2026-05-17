@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { MessageSquare, Send } from "lucide-react";
+import { MessageSquare, Send, Clock, Wrench, Coins, ShieldCheck, ShieldX, Eye, Loader2 } from "lucide-react";
 import { ChatMessage } from "../types";
 
 interface Props {
@@ -73,55 +73,30 @@ export default function ChatPanel({ messages, onSend, loading, compact }: Props)
                 {msg.content}
                 {msg.role === "assistant" && msg.trace_id && (
                   <div className="chat-meta">
-                    {msg.latency_ms && <span className="tag">{msg.latency_ms}ms</span>}
+                    {msg.latency_ms && <span className="badge badge--neutral"><Clock size={9} /> {msg.latency_ms}ms</span>}
                     {msg.tools_used?.map((t) => (
-                      <span key={t} className="tool-badge">{t}</span>
+                      <span key={t} className="badge badge--info"><Wrench size={9} /> {t}</span>
                     ))}
                     {msg.token_usage && (
-                      <span className="tag">{msg.token_usage.total_tokens} 토큰</span>
+                      <span className="badge badge--neutral badge--mono">{msg.token_usage.total_tokens} 토큰</span>
                     )}
                     {msg.cost && (
-                      <span className="tag" style={{ color: "var(--amber-light)" }}>
-                        ${msg.cost.total_cost.toFixed(5)}
-                      </span>
+                      <span className="badge badge--warning"><Coins size={9} /> ${msg.cost.total_cost.toFixed(5)}</span>
                     )}
                     {msg.guardrails && (
-                      <span
-                        className="tag"
-                        style={{
-                          color: msg.guardrails.passed
-                            ? "var(--green-light)"
-                            : "var(--red-light)",
-                          fontWeight: 600,
-                        }}
-                      >
-                        {msg.guardrails.passed ? "✓" : "✗"} 가드레일
-                        {msg.guardrails.violations.length > 0 &&
-                          ` (${msg.guardrails.violations.length}건)`}
+                      <span className={`badge ${msg.guardrails.passed ? "badge--success" : "badge--danger"}`}>
+                        {msg.guardrails.passed ? <ShieldCheck size={9} /> : <ShieldX size={9} />}
+                        가드레일{msg.guardrails.violations.length > 0 && ` (${msg.guardrails.violations.length}건)`}
                       </span>
                     )}
                     {msg.redacted && (
-                      <span className="tag" style={{ color: "var(--amber)" }}>
-                        PII 마스킹
-                      </span>
+                      <span className="badge badge--warning"><Eye size={9} /> PII 마스킹</span>
                     )}
                     {msg.evalLoading && (
-                      <span className="tag" style={{ color: "var(--gray-500)" }}>
-                        평가 중...
-                      </span>
+                      <span className="badge badge--neutral"><Loader2 size={9} className="spin" /> 평가 중</span>
                     )}
                     {msg.eval && (
-                      <span
-                        className="tag eval-inline-badge"
-                        style={{
-                          color: msg.eval.avg_score >= 0.8
-                            ? "var(--green-light)"
-                            : msg.eval.avg_score >= 0.6
-                              ? "var(--amber)"
-                              : "var(--red-light)",
-                          fontWeight: 600,
-                        }}
-                      >
+                      <span className={`badge ${msg.eval.avg_score >= 0.8 ? "badge--success" : msg.eval.avg_score >= 0.6 ? "badge--warning" : "badge--danger"}`}>
                         평가: {(msg.eval.avg_score * 100).toFixed(0)}% {msg.eval.label}
                       </span>
                     )}

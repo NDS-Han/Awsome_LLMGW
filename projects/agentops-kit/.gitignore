@@ -23,10 +23,16 @@ frontend/dist/
 gateway_config.json
 .env
 .rds-global-bundle.pem
-.bedrock_agentcore.yaml
 
 # OS
 .DS_Store
 
 # Evaluation results
 evaluation/results/
+
+# Local agent tooling state
+.omc/
+.superpowers/
+frontend/.omc/
+CLAUDE.md
+.bedrock_agentcore.yaml

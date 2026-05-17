@@ -1,4 +1,4 @@
-import { DollarSign, AlertCircle } from "lucide-react";
+import { DollarSign, AlertCircle, Coins, Users } from "lucide-react";
 import { CostGlobalState, SessionCostState } from "../types";
 
 interface Props {
@@ -46,9 +46,7 @@ export default function CostPanel({ global, session, compact }: Props) {
           <DollarSign size={14} />
           비용 추적
         </div>
-        <span style={{ fontSize: 11, color: "var(--gray-500)" }}>
-          활성 세션 {global.active_sessions}개
-        </span>
+        <span className="badge badge--neutral"><Users size={9} /> 활성 {global.active_sessions}</span>
       </div>
 
       <div className="panel-body">
@@ -90,16 +88,13 @@ export default function CostPanel({ global, session, compact }: Props) {
                 alignItems: "center",
                 gap: 6,
                 marginBottom: 6,
-                fontSize: 11,
-                fontWeight: 600,
-                color: BUDGET_COLOR[budget.status],
-                textTransform: "uppercase",
               }}
             >
-              {(budget.status === "warning" || budget.status === "exceeded") && (
-                <AlertCircle size={12} />
-              )}
-              예산 상태: {budget.status}
+              <span className={`status-dot ${budget.status === "ok" ? "status-dot--active" : budget.status === "exceeded" ? "status-dot--error" : "status-dot--warning"}`} />
+              <span className={`badge ${budget.status === "ok" ? "badge--success" : budget.status === "exceeded" ? "badge--danger" : "badge--warning"}`}>
+                {(budget.status === "warning" || budget.status === "exceeded") && <AlertCircle size={9} />}
+                예산: {budget.status.toUpperCase()}
+              </span>
             </div>
             <div
               style={{
@@ -139,8 +134,11 @@ export default function CostPanel({ global, session, compact }: Props) {
         {/* Session Cost Breakdown */}
         {session && !compact && (
           <>
-            <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 6 }}>
-              현재 세션 (호출 {session.call_count}회)
+            <div className="divider" />
+            <div className="section-block__title">
+              <Coins size={11} />
+              <span>현재 세션</span>
+              <span className="badge badge--neutral badge--mono">{session.call_count}회 호출</span>
             </div>
             <div
               style={{
@@ -171,8 +169,9 @@ export default function CostPanel({ global, session, compact }: Props) {
             {/* Model Breakdown */}
             {Object.keys(session.model_breakdown).length > 0 && (
               <div>
-                <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 6 }}>
-                  모델별 사용량
+                <div className="section-block__title">
+                  <DollarSign size={10} />
+                  <span>모델별 사용량</span>
                 </div>
                 {Object.entries(session.model_breakdown).map(([model, stats]) => (
                   <div
@@ -203,8 +202,10 @@ export default function CostPanel({ global, session, compact }: Props) {
         {/* Top Sessions */}
         {!compact && global.top_sessions.length > 0 && (
           <div style={{ marginTop: 12 }}>
-            <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 6 }}>
-              비용 상위 세션
+            <div className="divider" />
+            <div className="section-block__title">
+              <DollarSign size={10} />
+              <span>비용 상위 세션</span>
             </div>
             {global.top_sessions.map((s) => (
               <div

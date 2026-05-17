@@ -58,9 +58,10 @@ export default function UsersPanel({ compact }: { compact?: boolean }) {
     <div className="panel">
       <div className="panel-header">
         <div className="panel-title"><User size={14}/>사용자 — 비용 상위</div>
-        <span style={{fontSize:11,color:"var(--gray-500)"}}>
-          {users.length}명 · ${totalCost.toFixed(2)}
-        </span>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <span className="badge badge--neutral badge--mono">{users.length}명</span>
+          <span className="badge badge--warning badge--mono">${totalCost.toFixed(2)}</span>
+        </div>
       </div>
       <div className="panel-body">
         {/* 컨트롤 */}

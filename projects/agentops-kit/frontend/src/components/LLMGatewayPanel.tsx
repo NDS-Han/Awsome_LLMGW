@@ -52,9 +52,10 @@ export default function LLMGatewayPanel({ compact }: { compact?: boolean }) {
     <div className="panel">
       <div className="panel-header">
         <div className="panel-title"><Cpu size={14}/>LLM Gateway</div>
-        <span style={{fontSize:11,color:"var(--gray-500)"}}>
-          정책: {state.routing_policy} · 호출 {state.total_calls}회
-        </span>
+        <div style={{display:"flex",gap:6,alignItems:"center"}}>
+          <span className="badge badge--info">{state.routing_policy}</span>
+          <span className="badge badge--neutral badge--mono">{state.total_calls}회</span>
+        </div>
       </div>
       <div className="panel-body">
         {state.error && (
@@ -77,8 +78,9 @@ export default function LLMGatewayPanel({ compact }: { compact?: boolean }) {
           </div>
         )}
         {/* 모델 카탈로그 */}
-        <div style={{fontSize:11,color:"var(--gray-400)",marginBottom:8,textTransform:"uppercase",letterSpacing:0.5}}>
-          모델 카탈로그
+        <div className="section-block__title">
+          <Cpu size={10} />
+          <span>모델 카탈로그</span>
         </div>
         <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(200px,1fr))",gap:10,marginBottom:14}}>
           {state.models.map(m => (
@@ -93,9 +95,11 @@ export default function LLMGatewayPanel({ compact }: { compact?: boolean }) {
                 borderRadius:"var(--radius)",
             }}>
               <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:4}}>
-                <span style={{fontSize:12,fontWeight:600,color:"var(--gray-100)"}}>{m.name}</span>
-                <span style={{fontSize:10,color:m.tier==="quality"?"var(--amber-light)":"var(--blue-light)",
-                  padding:"2px 6px",background:"var(--navy)",borderRadius:3,fontWeight:600}}>
+                <div style={{display:"flex",alignItems:"center",gap:6}}>
+                  <span className={`status-dot ${state.last_model_used && m.id === state.last_model_used ? "status-dot--active status-dot--pulse" : "status-dot--idle"}`} />
+                  <span style={{fontSize:12,fontWeight:600,color:"var(--gray-100)"}}>{m.name}</span>
+                </div>
+                <span className={`badge ${m.tier==="quality"?"badge--warning":"badge--info"}`}>
                   {m.tier}
                 </span>
               </div>
@@ -113,6 +117,7 @@ export default function LLMGatewayPanel({ compact }: { compact?: boolean }) {
         </div>
 
         {/* 가드레일 */}
+        <div className="divider" />
         <div style={{
           padding:10,
           background:"var(--navy-darkest)",
@@ -126,23 +131,24 @@ export default function LLMGatewayPanel({ compact }: { compact?: boolean }) {
           <ShieldCheck size={18} style={{color:"var(--green-light)"}}/>
           <div>
             <div style={{fontSize:11,fontWeight:600,color:"var(--gray-200)"}}>가드레일 (PII 마스킹)</div>
-            <div style={{fontSize:11,color:"var(--gray-500)"}}>
-              입력 마스킹: <b style={{color:"var(--amber-light)"}}>{state.guardrails.input_scrubs}건</b> ·
-              출력 마스킹: <b style={{color:"var(--amber-light)"}}>{state.guardrails.output_scrubs}건</b>
+            <div style={{display:"flex",gap:6,marginTop:4}}>
+              <span className="badge badge--warning badge--mono">입력 {state.guardrails.input_scrubs}건</span>
+              <span className="badge badge--warning badge--mono">출력 {state.guardrails.output_scrubs}건</span>
             </div>
           </div>
           {Object.entries(state.guardrails.detected_tags).length > 0 && (
-            <div style={{marginLeft:"auto",display:"flex",gap:6,flexWrap:"wrap"}}>
+            <div style={{marginLeft:"auto",display:"flex",gap:4,flexWrap:"wrap"}}>
               {Object.entries(state.guardrails.detected_tags).map(([tag,count])=>(
-                <span key={tag} className="tool-badge">{tag}: {count}</span>
+                <span key={tag} className="badge badge--danger badge--mono">{tag}: {count}</span>
               ))}
             </div>
           )}
         </div>
 
         {/* 최근 호출 */}
-        <div style={{fontSize:11,color:"var(--gray-400)",marginBottom:6,textTransform:"uppercase",letterSpacing:0.5}}>
-          최근 LLM 호출
+        <div className="section-block__title">
+          <Zap size={10} />
+          <span>최근 LLM 호출</span>
         </div>
         {state.recent_calls.length === 0 ? (
           <div style={{fontSize:11,color:"var(--gray-500)",padding:10}}>아직 호출 내역이 없습니다 — 에이전트를 호출하면 표시됩니다.</div>

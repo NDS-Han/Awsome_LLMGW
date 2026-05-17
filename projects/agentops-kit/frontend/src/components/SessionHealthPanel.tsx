@@ -1,4 +1,4 @@
-import { HeartPulse, CircuitBoard, RefreshCw } from "lucide-react";
+import { HeartPulse, CircuitBoard, RefreshCw, Clock, AlertTriangle } from "lucide-react";
 import { api } from "../api";
 import { SessionState } from "../types";
 
@@ -67,9 +67,7 @@ export default function SessionHealthPanel({ session, onReset, compact }: Props)
           <HeartPulse size={14} />
           세션 상태
         </div>
-        <span style={{ fontSize: 11, color: "var(--gray-500)" }}>
-          {session.session_id.slice(0, 8)}...
-        </span>
+        <span className="badge badge--neutral badge--mono">{session.session_id.slice(0, 8)}</span>
       </div>
 
       <div className="panel-body">
@@ -92,19 +90,12 @@ export default function SessionHealthPanel({ session, onReset, compact }: Props)
               marginBottom: 6,
             }}
           >
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                fontSize: 11,
-                fontWeight: 600,
-                color: CIRCUIT_COLOR[cb.state],
-                fontFamily: "'JetBrains Mono', monospace",
-              }}
-            >
-              <CircuitBoard size={12} />
-              {CIRCUIT_LABEL[cb.state]}
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <span className={`status-dot ${cb.state === "closed" ? "status-dot--active" : cb.state === "open" ? "status-dot--error status-dot--pulse" : "status-dot--warning status-dot--pulse"}`} />
+              <CircuitBoard size={12} style={{ color: CIRCUIT_COLOR[cb.state] }} />
+              <span style={{ fontSize: 11, fontWeight: 600, color: CIRCUIT_COLOR[cb.state], fontFamily: "'JetBrains Mono', monospace" }}>
+                {CIRCUIT_LABEL[cb.state]}
+              </span>
             </div>
             {cb.state === "open" && (
               <button className="btn btn-secondary btn-sm" onClick={handleReset}>
@@ -220,23 +211,27 @@ export default function SessionHealthPanel({ session, onReset, compact }: Props)
             />
           </div>
           {session.compacted && (
-            <div
-              style={{
-                fontSize: 10,
-                color: "var(--amber)",
-                marginTop: 4,
-                fontStyle: "italic",
-              }}
-            >
-              ⚠ 대화가 {session.compaction_count}회 압축되었습니다
+            <div style={{ marginTop: 4 }}>
+              <span className="badge badge--warning"><AlertTriangle size={9} /> {session.compaction_count}회 압축</span>
             </div>
           )}
         </div>
 
         {!compact && (
-          <div style={{ fontSize: 10, color: "var(--gray-500)", lineHeight: 1.5 }}>
-            <div>생성: {new Date(session.created_at).toLocaleString()}</div>
-            <div>마지막 활동: {new Date(session.last_activity).toLocaleString()}</div>
+          <div className="divider" style={{ marginTop: 8 }} />
+        )}
+        {!compact && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+            <div className="info-row">
+              <span className="info-row__icon"><Clock size={9} /></span>
+              <span className="info-row__label">생성</span>
+              <span className="info-row__value">{new Date(session.created_at).toLocaleString()}</span>
+            </div>
+            <div className="info-row">
+              <span className="info-row__icon"><Clock size={9} /></span>
+              <span className="info-row__label">마지막</span>
+              <span className="info-row__value">{new Date(session.last_activity).toLocaleString()}</span>
+            </div>
           </div>
         )}
       </div>

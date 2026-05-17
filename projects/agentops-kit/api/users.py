@@ -129,19 +129,25 @@ def _ttl_epoch(days: int = TTL_DAYS) -> int:
 
 
 def get_user_ctx(
+    authorization: Optional[str] = Header(default=None),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
     x_team_id: Optional[str] = Header(default=None, alias="X-Team-Id"),
     x_user_role: Optional[str] = Header(default=None, alias="X-User-Role"),
 ) -> UserCtx:
     """
-    헤더 기반 인증 (데모용).
-    프로덕션은 AUTH_MODE=jwt 환경변수로 Cognito JWT 검증으로 스왑 가능.
+    AUTH_MODE=jwt (기본): Cognito JWT 검증.
+    AUTH_MODE=header: 기존 헤더 기반 (개발/테스트 폴백).
     """
+    auth_mode = os.getenv("AUTH_MODE", "jwt")
+
+    if auth_mode == "jwt":
+        from api.auth import get_authenticated_user
+        return get_authenticated_user(authorization)
+
+    # Legacy header mode
     if not x_user_id:
-        # 비익명 호출 — 익명 user로 처리
         x_user_id = "anonymous"
         x_team_id = x_team_id or "default"
-
     if not x_team_id:
         x_team_id = "default"
 

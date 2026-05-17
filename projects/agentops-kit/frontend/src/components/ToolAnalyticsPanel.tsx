@@ -71,13 +71,11 @@ function ToolCard({ tool }: { tool: ToolStats }) {
           {tool.tool_name.replace(/_/g, " ")}
         </span>
         <span
+          className="badge"
           style={{
-            fontSize: 10,
-            fontWeight: 700,
             color: tool.success_rate >= 0.95 ? "#22c55e" : tool.success_rate >= 0.8 ? "#f59e0b" : "#ef4444",
-            padding: "1px 6px",
-            borderRadius: 4,
             background: `${tool.success_rate >= 0.95 ? "#22c55e" : tool.success_rate >= 0.8 ? "#f59e0b" : "#ef4444"}20`,
+            border: `1px solid ${tool.success_rate >= 0.95 ? "#22c55e" : tool.success_rate >= 0.8 ? "#f59e0b" : "#ef4444"}40`,
           }}
         >
           성공률 {successPct}%
@@ -158,30 +156,12 @@ function PatternRow({ pattern }: { pattern: SelectionPattern }) {
         borderBottom: "1px solid var(--gray-800, #1f2937)",
       }}
     >
-      <span
-        style={{
-          display: "inline-block",
-          width: 8,
-          height: 8,
-          borderRadius: "50%",
-          background: getColor(pattern.from_tool),
-          flexShrink: 0,
-        }}
-      />
+      <span className="status-dot" style={{ background: getColor(pattern.from_tool), width: 8, height: 8 }} />
       <span style={{ color: "var(--gray-300)", minWidth: 120 }}>
         {pattern.from_tool.replace(/_/g, " ")}
       </span>
       <span style={{ color: "var(--gray-600)" }}>→</span>
-      <span
-        style={{
-          display: "inline-block",
-          width: 8,
-          height: 8,
-          borderRadius: "50%",
-          background: getColor(pattern.to_tool),
-          flexShrink: 0,
-        }}
-      />
+      <span className="status-dot" style={{ background: getColor(pattern.to_tool), width: 8, height: 8 }} />
       <span style={{ color: "var(--gray-300)", flex: 1 }}>
         {pattern.to_tool.replace(/_/g, " ")}
       </span>
@@ -243,9 +223,7 @@ export default function ToolAnalyticsPanel({ compact }: { compact?: boolean }) {
           <PieChart size={14} />
           도구 사용 분석
         </div>
-        <span style={{ fontSize: 11, color: "var(--gray-500)" }}>
-          {data ? `총 호출 ${data.total_calls}회` : "불러오는 중…"}
-        </span>
+        {data && <span className="badge badge--neutral badge--mono">총 {data.total_calls}회</span>}
       </div>
 
       <div className="panel-body">
@@ -324,17 +302,9 @@ export default function ToolAnalyticsPanel({ compact }: { compact?: boolean }) {
 
             {/* Tool cards */}
             <div style={{ marginBottom: 16 }}>
-              <div
-                style={{
-                  fontSize: 11,
-                  fontWeight: 600,
-                  color: "var(--gray-400)",
-                  marginBottom: 8,
-                  textTransform: "uppercase",
-                  letterSpacing: 0.5,
-                }}
-              >
-                도구 성능
+              <div className="section-block__title">
+                <PieChart size={10} />
+                <span>도구 성능</span>
               </div>
               {data.tools.map((tool) => (
                 <ToolCard key={tool.tool_name} tool={tool} />
@@ -344,17 +314,10 @@ export default function ToolAnalyticsPanel({ compact }: { compact?: boolean }) {
             {/* Selection patterns */}
             {data.selection_patterns.length > 0 && (
               <div>
-                <div
-                  style={{
-                    fontSize: 11,
-                    fontWeight: 600,
-                    color: "var(--gray-400)",
-                    marginBottom: 8,
-                    textTransform: "uppercase",
-                    letterSpacing: 0.5,
-                  }}
-                >
-                  도구 선택 패턴
+                <div className="divider" />
+                <div className="section-block__title">
+                  <PieChart size={10} />
+                  <span>도구 선택 패턴</span>
                 </div>
                 <div
                   style={{

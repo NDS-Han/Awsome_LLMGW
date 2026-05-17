@@ -4,6 +4,37 @@ AgentCore Observability가 ADOT로 수집한 span을 CloudWatch에서 조회할 
 사용하는 헬퍼 함수만 제공한다. Span 생성은 ADOT 자동 계측에 위임.
 """
 
+import asyncio
+import time as _time
+from typing import Any
+
+_span_event_queues: list[asyncio.Queue] = []
+
+
+def publish_span_event(event_type: str, data: dict[str, Any]) -> None:
+    """Publish a span event to all connected SSE listeners."""
+    event = {"type": event_type, "data": data, "ts": _time.time()}
+    for q in list(_span_event_queues):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
+
+def subscribe_span_events() -> asyncio.Queue:
+    """Create a new subscriber queue for SSE streaming."""
+    q: asyncio.Queue = asyncio.Queue(maxsize=100)
+    _span_event_queues.append(q)
+    return q
+
+
+def unsubscribe_span_events(q: asyncio.Queue) -> None:
+    """Remove a subscriber queue."""
+    try:
+        _span_event_queues.remove(q)
+    except ValueError:
+        pass
+
 
 def inject_traceparent() -> str:
     """현재 OTEL span context에서 W3C traceparent 헤더 값을 생성."""

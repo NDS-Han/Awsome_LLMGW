@@ -17,8 +17,14 @@ boto3>=1.34.0
 # .env 자동 로드
 python-dotenv>=1.0.0
 
+# Langfuse (LLM observability)
+langfuse>=2.0.0
+
 # OpenTelemetry (ADOT — AWS 권장 자동 계측, 개별 패키지 포함)
 aws-opentelemetry-distro>=0.7.0
+
+# JWT verification (Cognito)
+python-jose[cryptography]>=3.3.0
 
 # Gateway setup (optional)
 # bedrock-agentcore-starter-toolkit

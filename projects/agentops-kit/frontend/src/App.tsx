@@ -4,15 +4,14 @@ import {
   ChatMessage,
   Trace,
   MetricsData,
-  EvalEntry,
   GuardrailResult,
   SessionState,
   CostGlobalState,
   SessionCostState,
-  TurnEvalResult,
-  ImprovementState,
-  EvalAnalysis,
+  OptimizationStatus,
 } from "./types";
+import { isAuthenticated, getCurrentUser, signOut as authSignOut, configureAuth } from "./auth";
+import LoginForm from "./components/LoginForm";
 import ChatPanel from "./components/ChatPanel";
 import TraceViewer from "./components/TraceViewer";
 import MetricsPanel from "./components/MetricsPanel";
@@ -30,6 +29,7 @@ import AnomalyPanel from "./components/AnomalyPanel";
 import SessionExplorerPanel from "./components/SessionExplorerPanel";
 import ToolAnalyticsPanel from "./components/ToolAnalyticsPanel";
 import GatewayJourneyStrip from "./components/GatewayJourneyStrip";
+import OptimizationPanel from "./components/OptimizationPanel";
 import ErrorBoundary from "./components/ErrorBoundary";
 import {
   Activity,
@@ -49,6 +49,7 @@ import {
   AlertTriangle,
   Layers,
   PieChart,
+  TrendingUp,
 } from "lucide-react";
 import "./styles.css";
 
@@ -58,6 +59,7 @@ type Tab =
   | "traces"
   | "metrics"
   | "evaluation"
+  | "optimization"
   | "guardrails"
   | "cost"
   | "session"
@@ -81,22 +83,23 @@ interface TabConfig {
 
 const TAB_CONFIG: Record<Tab, TabConfig> = {
   overview:         { main: "chat",              companions: ["traces","metrics","evaluation","guardrails","cost","session"],    defaultActive: ["chat","traces","metrics","evaluation","cost","session"] },
-  chat:             { main: "chat",              companions: ["traces","guardrails","cost","metrics","session"],                defaultActive: ["traces","guardrails"] },
-  traces:           { main: "traces",            companions: ["metrics","tool_analytics","session"],                              defaultActive: ["metrics"] },
-  metrics:          { main: "metrics",           companions: ["traces","cost","session"],                                      defaultActive: ["traces","cost"] },
-  evaluation:       { main: "evaluation",        companions: ["metrics","cost","chat"],                                        defaultActive: ["metrics"] },
-  guardrails:       { main: "guardrails",        companions: ["chat","traces","cost"],                                         defaultActive: ["chat","traces"] },
-  cost:             { main: "cost",              companions: ["metrics","session","guardrails","anomaly"],                      defaultActive: ["metrics","session"] },
-  session:          { main: "session",           companions: ["traces","guardrails","cost","anomaly"],                          defaultActive: ["traces","cost"] },
-  llm_gateway:      { main: "llm_gateway",       companions: ["cost","metrics","guardrails"],                                  defaultActive: ["cost"] },
-  tool_gateway:     { main: "tool_gateway",      companions: ["tool_analytics","traces"],                                      defaultActive: ["tool_analytics"] },
-  agent_gateway:    { main: "agent_gateway",     companions: ["traces","session"],                                             defaultActive: ["traces"] },
-  registry:         { main: "registry",          companions: ["tool_gateway","agent_gateway"],                                 defaultActive: [] },
-  users:            { main: "users",             companions: ["cost","session"],                                               defaultActive: ["cost"] },
-  teams:            { main: "teams",             companions: ["cost","users"],                                                 defaultActive: ["cost"] },
-  session_explorer: { main: "session_explorer",  companions: ["traces","metrics","session"],                                   defaultActive: ["traces"] },
-  tool_analytics:   { main: "tool_analytics",    companions: ["traces","tool_gateway"],                                        defaultActive: ["traces"] },
-  anomaly:          { main: "anomaly",           companions: ["metrics","guardrails","session"],                                defaultActive: ["metrics"] },
+  chat:             { main: "chat",              companions: ["traces","guardrails","cost","metrics","evaluation","session"],   defaultActive: [] },
+  traces:           { main: "traces",            companions: ["metrics","chat","tool_analytics","session"],                     defaultActive: [] },
+  metrics:          { main: "metrics",           companions: ["traces","cost","session"],                                      defaultActive: [] },
+  evaluation:       { main: "evaluation",        companions: ["metrics","cost","chat"],                                        defaultActive: [] },
+  optimization:     { main: "optimization",      companions: ["evaluation","chat","metrics"],                                  defaultActive: [] },
+  guardrails:       { main: "guardrails",        companions: ["chat","traces","cost"],                                         defaultActive: [] },
+  cost:             { main: "cost",              companions: ["metrics","session","guardrails","anomaly"],                      defaultActive: [] },
+  session:          { main: "session",           companions: ["traces","guardrails","cost","anomaly"],                          defaultActive: [] },
+  llm_gateway:      { main: "llm_gateway",       companions: ["tool_gateway","agent_gateway"],                                 defaultActive: [] },
+  tool_gateway:     { main: "tool_gateway",      companions: ["tool_analytics","traces"],                                      defaultActive: [] },
+  agent_gateway:    { main: "agent_gateway",     companions: ["traces","session"],                                             defaultActive: [] },
+  registry:         { main: "registry",          companions: ["llm_gateway","tool_gateway","agent_gateway","traces"],          defaultActive: [] },
+  users:            { main: "users",             companions: ["teams","cost","session"],                                        defaultActive: ["teams","cost"] },
+  teams:            { main: "teams",             companions: ["users","cost","session"],                                        defaultActive: [] },
+  session_explorer: { main: "session_explorer",  companions: ["traces","metrics","session"],                                   defaultActive: [] },
+  tool_analytics:   { main: "tool_analytics",    companions: ["traces","tool_gateway"],                                        defaultActive: [] },
+  anomaly:          { main: "anomaly",           companions: ["metrics","guardrails","session"],                                defaultActive: [] },
 };
 
 const PANEL_LABELS: Record<PanelId, { label: string; icon: React.ReactNode }> = {
@@ -104,6 +107,7 @@ const PANEL_LABELS: Record<PanelId, { label: string; icon: React.ReactNode }> = 
   traces:           { label: "트레이스",    icon: <Zap size={12}/> },
   metrics:          { label: "메트릭",      icon: <BarChart3 size={12}/> },
   evaluation:       { label: "평가",        icon: <Shield size={12}/> },
+  optimization:     { label: "최적화",      icon: <TrendingUp size={12}/> },
   guardrails:       { label: "가드레일",    icon: <ShieldCheck size={12}/> },
   cost:             { label: "비용",        icon: <DollarSign size={12}/> },
   session:          { label: "세션",        icon: <HeartPulse size={12}/> },
@@ -124,7 +128,6 @@ export default function App() {
   const [traces, setTraces] = useState<Trace[]>([]);
   const [selectedTrace, setSelectedTrace] = useState<Trace | null>(null);
   const [metrics, setMetrics] = useState<MetricsData | null>(null);
-  const [evalHistory, setEvalHistory] = useState<EvalEntry[]>([]);
   const [promptVersion, setPromptVersion] = useState("v1");
   const [loading, setLoading] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -139,13 +142,12 @@ export default function App() {
   // Agent selection state
   const [agents, setAgents] = useState<{ agent_id: string; name: string }[]>([]);
   const [selectedAgentId, setSelectedAgentId] = useState<string | undefined>(undefined);
+  const [metricsHours, setMetricsHours] = useState(24);
+  const [metricsScope, setMetricsScope] = useState<"all" | "me">("all");
+  const [traceHours, setTraceHours] = useState(6);
 
-  // Online evaluation state
-  const [turnEvals, setTurnEvals] = useState<Record<string, TurnEvalResult>>({});
-  const [turnEvalOrder, setTurnEvalOrder] = useState<string[]>([]);
-  const [improvementState, setImprovementState] = useState<ImprovementState>({ status: "idle" });
-  const [evalAnalysis, setEvalAnalysis] = useState<EvalAnalysis | null>(null);
-  const [isEvalRunning, setIsEvalRunning] = useState(false);
+  // Optimization state
+  const [optimizationStatus, setOptimizationStatus] = useState<OptimizationStatus>({ stage: "idle", history: [] });
 
   // Companion panel toggle state
   const [activeCompanions, setActiveCompanions] = useState<Record<Tab, PanelId[]>>(() => {
@@ -155,6 +157,25 @@ export default function App() {
     }
     return initial as Record<Tab, PanelId[]>;
   });
+
+  // Auth state
+  const [authed, setAuthed] = useState<boolean | null>(null);
+  const [authUser, setAuthUser] = useState<string>("");
+  const [authUserId, setAuthUserId] = useState<string>("");
+
+  useEffect(() => {
+    configureAuth();
+    isAuthenticated().then(ok => {
+      setAuthed(ok);
+      if (ok) getCurrentUser().then(u => { setAuthUser(u?.username || ""); setAuthUserId(u?.userId || ""); });
+    });
+  }, []);
+
+  const handleLogout = async () => {
+    await authSignOut();
+    setAuthed(false);
+    setAuthUser("");
+  };
 
   const toggleCompanion = (tab: Tab, panelId: PanelId) => {
     setActiveCompanions(prev => {
@@ -180,14 +201,11 @@ export default function App() {
   const refreshData = useCallback(async () => {
     try {
       const calls: Promise<any>[] = [
-        api.getTraces(20),
-        api.getMetrics(24, selectedAgentId),
-        api.getEvalHistory(),
+        api.getTraces(20, traceHours),
+        api.getMetrics(metricsHours, selectedAgentId, metricsScope === "me" ? authUserId || undefined : undefined),
         api.getCostOverview(),
-        api.getTurnEvals(),
-        api.getImprovement(),
+        api.getOptimizationStatus(),
         api.getAgents(),
-        api.getEvalAnalysis(),
       ];
       if (currentSessionId) {
         calls.push(api.getSession(currentSessionId));
@@ -195,34 +213,17 @@ export default function App() {
       const results = await Promise.all(calls);
       setTraces(results[0].traces || []);
       setMetrics(results[1]);
-      setEvalHistory(results[2].history || []);
-      setCostGlobal(results[3]);
-      // Turn evals + improvement
-      const turnData = results[4];
-      setTurnEvals(turnData.turn_evals || {});
-      setTurnEvalOrder(turnData.trend?.map((t: any) => t.turn_id) || []);
-      setImprovementState(results[5] || { status: "idle" });
-      setAgents(results[6]?.agents || []);
-      setEvalAnalysis(results[7] || null);
-      // Attach eval results to existing messages
-      setMessages((prev) =>
-        prev.map((msg) => {
-          if (msg.role !== "assistant" || !msg.turn_id) return msg;
-          const ev = turnData.turn_evals?.[msg.turn_id];
-          if (ev && !msg.eval) {
-            return { ...msg, eval: { avg_score: ev.avg_score, label: ev.scores?.[0]?.label || "" }, evalLoading: false };
-          }
-          return msg;
-        }),
-      );
-      if (currentSessionId && results[8]) {
-        setSessionState(results[8]);
-        setSessionCost(results[8].cost_state);
+      setCostGlobal(results[2]);
+      setOptimizationStatus(results[3] || { stage: "idle", history: [] });
+      setAgents(results[4]?.agents || []);
+      if (currentSessionId && results[5]) {
+        setSessionState(results[5]);
+        setSessionCost(results[5].cost_state);
       }
     } catch {
       // silent
     }
-  }, [currentSessionId, selectedAgentId]);
+  }, [currentSessionId, selectedAgentId, metricsHours, metricsScope, authUserId, traceHours]);
 
   useEffect(() => {
     if (connected) {
@@ -401,56 +402,8 @@ export default function App() {
     void placeholderIndex;
   };
 
-  const handleSwitchPrompt = async (version: string) => {
-    try {
-      await api.setPromptVersion(version);
-      setPromptVersion(version);
-    } catch (e: any) {
-      console.error("Failed to switch prompt:", e);
-    }
-  };
 
-  const handleRunEval = async () => {
-    setIsEvalRunning(true);
-    try {
-      await api.runEvaluation([
-        "Builtin.Helpfulness",
-        "Builtin.Correctness",
-        "Builtin.GoalSuccessRate",
-        "Builtin.Faithfulness",
-        "Builtin.ToolSelectionAccuracy",
-        "Builtin.Conciseness",
-      ]);
-      refreshData();
-    } catch (e: any) {
-      console.error("Failed to run evaluation:", e);
-    } finally {
-      setIsEvalRunning(false);
-    }
-  };
 
-  const handleApplyImprovement = async () => {
-    try {
-      await api.applyImprovement();
-      const imp = await api.getImprovement();
-      setImprovementState(imp);
-      if (imp.suggestion?.suggested_version) {
-        setPromptVersion(imp.suggestion.suggested_version);
-      }
-      refreshData();
-    } catch (e: any) {
-      console.error("Failed to apply improvement:", e);
-    }
-  };
-
-  const handleResetImprovement = async () => {
-    try {
-      await api.resetImprovement();
-      setImprovementState({ status: "idle" });
-    } catch (e: any) {
-      console.error("Failed to reset improvement:", e);
-    }
-  };
 
   const renderPanel = (panelId: PanelId, compact: boolean) => {
     return (
@@ -465,11 +418,13 @@ export default function App() {
       case "chat":
         return <ChatPanel messages={messages} onSend={handleSend} loading={loading} compact={compact} />;
       case "traces":
-        return <TraceViewer traces={traces} selectedTrace={selectedTrace} onSelectTrace={setSelectedTrace} compact={compact} />;
+        return <TraceViewer traces={traces} selectedTrace={selectedTrace} onSelectTrace={setSelectedTrace} onHoursChange={setTraceHours} compact={compact} />;
       case "metrics":
-        return <MetricsPanel metrics={metrics} compact={compact} agents={agents} selectedAgentId={selectedAgentId} onSelectAgent={setSelectedAgentId} />;
+        return <MetricsPanel metrics={metrics} compact={compact} agents={agents} selectedAgentId={selectedAgentId} onSelectAgent={setSelectedAgentId} metricsHours={metricsHours} onChangeHours={setMetricsHours} metricsScope={metricsScope} onChangeScope={setMetricsScope} />;
       case "evaluation":
-        return <EvalPanel evalHistory={evalHistory} promptVersion={promptVersion} onSwitchPrompt={handleSwitchPrompt} onRunEval={handleRunEval} isEvalRunning={isEvalRunning} turnEvals={turnEvals} turnEvalOrder={turnEvalOrder} improvementState={improvementState} onApplyImprovement={handleApplyImprovement} onResetImprovement={handleResetImprovement} evalAnalysis={evalAnalysis} compact={compact} />;
+        return <EvalPanel compact={compact} />;
+      case "optimization":
+        return <OptimizationPanel status={optimizationStatus} promptVersion={promptVersion} compact={compact} />;
       case "guardrails":
         return <GuardrailsPanel latestGuardrail={latestGuardrail} compact={compact} />;
       case "cost":
@@ -561,6 +516,14 @@ export default function App() {
     window.addEventListener("mouseup", onUp);
   };
 
+  // Auth gate
+  if (authed === null) {
+    return <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh", color: "#666" }}>Loading...</div>;
+  }
+  if (!authed) {
+    return <LoginForm onSuccess={() => { setAuthed(true); getCurrentUser().then(u => { setAuthUser(u?.username || ""); setAuthUserId(u?.userId || ""); }); }} />;
+  }
+
   const config = TAB_CONFIG[activeTab];
   const companions = activeCompanions[activeTab].filter(id => config.companions.includes(id));
   const companionKey = companions.join(",");
@@ -581,6 +544,7 @@ export default function App() {
         { id: "traces", label: "트레이스", icon: <Zap size={14} /> },
         { id: "metrics", label: "메트릭", icon: <BarChart3 size={14} /> },
         { id: "evaluation", label: "평가", icon: <Shield size={14} /> },
+        { id: "optimization", label: "최적화", icon: <TrendingUp size={14} /> },
       ],
     },
     {
@@ -621,33 +585,20 @@ export default function App() {
           </span>
         </div>
         <div className="header-right">
-          {sessionState?.circuit_breaker && (
-            <div
-              className={`status-badge ${
-                sessionState.circuit_breaker.state === "closed"
-                  ? "connected"
-                  : "disconnected"
-              }`}
-            >
-              <span className="status-dot" />
-              Circuit Breaker: {sessionState.circuit_breaker.state}
-            </div>
-          )}
           {costGlobal && (
             <div className="prompt-badge">
               <DollarSign size={10} style={{ verticalAlign: "middle" }} />
               ${costGlobal.total_cost.toFixed(4)}
             </div>
           )}
-          <div
-            className={`status-badge ${connected ? "connected" : "disconnected"}`}
-          >
-            <span className="status-dot" />
-            {connected ? "연결됨" : "연결 끊김"}
-          </div>
-          <div className="prompt-badge">
-            프롬프트: <strong>{promptVersion.toUpperCase()}</strong>
-          </div>
+          <span style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ color: "var(--gray-400)", fontSize: 12 }}>{authUser}</span>
+            <button onClick={handleLogout} style={{
+              background: "transparent", border: "1px solid var(--gray-700)",
+              color: "var(--gray-300)", borderRadius: 4, padding: "4px 10px",
+              fontSize: 11, cursor: "pointer",
+            }}>Logout</button>
+          </span>
         </div>
       </header>
 
@@ -715,7 +666,7 @@ export default function App() {
                           />
                         )}
                         <div className="flex-grid-companion" style={{ flex: cHeights[idx] }}>
-                          {renderPanel(id, true)}
+                          {renderPanel(id, false)}
                         </div>
                       </Fragment>
                     ))}

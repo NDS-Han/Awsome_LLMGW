@@ -28,11 +28,11 @@ try:
     from dotenv import load_dotenv
     _env = Path(__file__).resolve().parent.parent / ".env"
     if _env.exists():
-        load_dotenv(_env)
+        load_dotenv(_env, override=True)
 except ImportError:
     pass
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -41,10 +41,17 @@ from api.agentcore_runtime import invoke_runtime
 from api.cloudwatch import cw_helper, AGENT_ID
 from api.cloudwatch import cw_helper as _cw_ref  # noqa: ensure module loads
 from api.genai_metrics import record_invocation as record_genai_metrics, record_error as record_genai_error, init_metrics as init_genai_metrics
+from api.persistence import get_persistence
 
 
 # 프롬프트 버전 상태는 이제 FastAPI 측에서만 관리 (Runtime 호출 시 payload로 전달)
 _current_prompt_version = os.getenv("PROMPT_VERSION", "v1")
+_RUNTIME_NAME = os.getenv("AGENTCORE_RUNTIME_NAME", "ecommerce_analytics")
+_GATEWAY_NAME = os.getenv("AGENTCORE_GATEWAY_NAME", "agentops-ecommerce-gateway")
+_GATEWAY_TARGET_NAME = os.getenv("GATEWAY_TARGET_NAME", "EcommerceAnalyticsTools")
+_AGENT_RUNTIME_NAMES = os.getenv("AGENT_RUNTIME_NAMES", "ecommerce_analytics,reviews_specialist,logistics_specialist").split(",")
+_MAIN_RUNTIME = _AGENT_RUNTIME_NAMES[0] if _AGENT_RUNTIME_NAMES else "ecommerce_analytics"
+_ALARM_PREFIX = os.getenv("ALARM_PREFIX", "agentops-anomaly")
 
 
 def get_current_prompt_version() -> str:
@@ -53,7 +60,8 @@ def get_current_prompt_version() -> str:
 
 def set_prompt_version(version: str) -> bool:
     global _current_prompt_version
-    if version in ("v1", "v2", "v3"):
+    from agent.system_prompt import PROMPT_VERSIONS
+    if version in PROMPT_VERSIONS:
         _current_prompt_version = version
         return True
     return False
@@ -61,12 +69,13 @@ from api.guardrails import validate_response, redact_pii, GuardrailResult
 from api.cost_tracker import get_tracker, TokenUsage
 from api.errors import classify_error, get_retry_delay_ms
 from api.session import get_session_store, CircuitState
-from api.analytics import get_queue, get_memory_sink, Events, emit
+from api.analytics import get_queue, get_memory_sink, Events, emit, _ensure_cw_sink
 from api.users import (
     UserCtx, UsageRecord, get_user_ctx, record_usage, enforce_budget,
     get_budget_state, set_budget, list_users, list_teams, get_directory_entry,
     get_user_usage, get_team_usage, top_users, top_teams,
 )
+from api.telemetry import publish_span_event, subscribe_span_events, unsubscribe_span_events
 from fastapi import Depends
 
 app = FastAPI(
@@ -86,6 +95,68 @@ def _startup_otel():
         init_genai_metrics()
     except Exception:
         pass
+    _ensure_cw_sink()
+
+    from api.langfuse_tracing import init_langfuse
+    init_langfuse()
+
+
+@app.on_event("shutdown")
+def _shutdown_langfuse():
+    from api.langfuse_tracing import flush
+    flush()
+
+
+@app.on_event("startup")
+def _restore_persisted_state():
+    """Restore in-memory state from DynamoDB on server start."""
+    global _chat_history
+    global _llm_gateway_acc, _optimization_state
+
+    persistence = get_persistence()
+
+    try:
+        _chat_history = persistence.load_chat_history(limit=100)
+        print(f"[restore] chat_history: {len(_chat_history)} entries")
+    except Exception as e:
+        print(f"[restore] chat_history failed: {e}")
+
+    # Evaluation state is now managed by AgentCore Online Evaluation Config
+    # (no in-memory eval state to restore)
+
+    try:
+        sessions = persistence.load_sessions()
+        if sessions:
+            get_session_store()._sessions = sessions
+            print(f"[restore] sessions: {len(sessions)} entries")
+    except Exception as e:
+        print(f"[restore] sessions failed: {e}")
+
+    try:
+        restored_gw = persistence.load_llm_gateway()
+        if restored_gw:
+            _llm_gateway_acc.update(restored_gw)
+            print("[restore] llm_gateway_acc restored")
+    except Exception as e:
+        print(f"[restore] llm_gateway failed: {e}")
+
+    try:
+        restored_opt = persistence.load_optimization_state()
+        if restored_opt:
+            _optimization_state.update(restored_opt)
+            print(f"[restore] optimization_state: stage={restored_opt.get('stage')}")
+    except Exception as e:
+        print(f"[restore] optimization failed: {e}")
+
+    try:
+        cost_sessions, global_cost = persistence.load_cost_state()
+        if cost_sessions:
+            tracker = get_tracker()
+            tracker._sessions = cost_sessions
+            tracker._global_cost = global_cost
+            print(f"[restore] cost_tracker: {len(cost_sessions)} sessions, ${global_cost:.4f}")
+    except Exception as e:
+        print(f"[restore] cost failed: {e}")
 
 # 전역 예외 핸들러 — 내부 스택 트레이스가 응답으로 새지 않도록
 from fastapi import Request
@@ -94,9 +165,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 @app.exception_handler(Exception)
 async def _unhandled_exception_handler(request: Request, exc: Exception):
+    print(f"[error] {request.method} {request.url.path}: {type(exc).__name__}: {exc}")
     return JSONResponse(
         status_code=500,
-        content={"error": "internal_server_error", "path": str(request.url.path)},
+        content={"error": "internal_server_error", "path": str(request.url.path), "detail": str(exc)},
     )
 
 # CORS origins는 환경변수로 제어. 기본은 로컬 개발 포트만 허용.
@@ -150,6 +222,7 @@ class ChatResponse(BaseModel):
 class EvalRequest(BaseModel):
     session_id: Optional[str] = Field(default=None, pattern=_SESSION_ID_PATTERN)
     trace_id: Optional[str] = None
+    lookback_days: int = Field(default=7, ge=1, le=90)
     evaluators: list[str] = Field(
         default=[
             "Builtin.Helpfulness",
@@ -234,9 +307,6 @@ def _merge_llm_gateway_snapshot(snap: dict) -> None:
         _llm_gateway_acc["last_model_used"] = snap["last_model_used"]
     if snap.get("last_routing_reason"):
         _llm_gateway_acc["last_routing_reason"] = snap["last_routing_reason"]
-_eval_history: list[dict] = []
-_turn_evals: dict[str, dict] = {}
-_turn_eval_order: list[str] = []
 # 가장 최근 /chat 턴의 Gateway 요약 — Journey Strip과 /gateways/* 의 last_* 필드 전용.
 _last_turn_summary: Optional[dict] = None
 
@@ -249,14 +319,11 @@ def _infer_specialist(prompt: str, tools_used: list[str]) -> str:
     if any(k in p for k in ["배송", "물류", "셀러", "delivery", "shipping", "seller"]):
         return "logistics"
     return "specialist"
-_improvement_state: dict = {
-    "status": "idle",
-    "trigger_score": None,
-    "suggestion": None,
-    "before_score": None,
-    "after_score": None,
+_optimization_state: dict = {
+    "stage": "idle",
+    "active_recommendation": None,
+    "active_test": None,
 }
-_custom_evaluator_id: Optional[str] = None
 
 
 # --- Endpoints ---
@@ -394,6 +461,7 @@ async def chat(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
         })
         session.context_tokens_used += token_usage.billable_tokens
         session.circuit_breaker.record_success()
+        get_session_store().persist(session_id)
 
         # GenAI 메트릭 기록 (ADOT meter → CloudWatch)
         guardrail_viol_count = len(guardrail_result.violations) if guardrail_result else 0
@@ -420,13 +488,16 @@ async def chat(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
         )
 
         # User/Team 사용량 기록 (비동기 DynamoDB write)
+        # Runtime이 토큰을 반환하지 않으면 텍스트 길이로 추정
+        _rec_input = token_usage.input_tokens or max(len(req.prompt) // 4, 1)
+        _rec_output = token_usage.output_tokens or max(len(response_text) // 4, 1)
         record_usage(UsageRecord(
             user_id=ctx.user_id,
             team_id=ctx.team_id,
             timestamp=datetime.utcnow().isoformat(),
-            input_tokens=token_usage.input_tokens,
-            output_tokens=token_usage.output_tokens,
-            total_tokens=token_usage.total_tokens,
+            input_tokens=_rec_input,
+            output_tokens=_rec_output,
+            total_tokens=_rec_input + _rec_output,
             cost_usd=cost_info["cost"]["total_cost"],
             model=MODEL_ID,
             tools_used=tools_used,
@@ -446,6 +517,7 @@ async def chat(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
             "tools_used": tools_used,
             "timestamp": datetime.utcnow().isoformat(),
         })
+        get_persistence().persist_chat(_chat_history[-1])
 
         # Gateway 5분 데모용: 최근 턴 요약 캐시
         global _last_turn_summary
@@ -465,13 +537,24 @@ async def chat(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
             "timestamp": datetime.utcnow().isoformat(),
         }
 
-        # 비동기 자동 평가 트리거 (논블로킹)
-        eval_session = runtime_session_id or session_id
-        eval_trace = otel_trace_id or runtime_trace_id or trace_id
-        asyncio.create_task(_auto_evaluate_turn(
-            turn_id, eval_trace, req.prompt, response_text,
-            tools_used=tools_used, session_id=eval_session,
-        ))
+
+        # Langfuse trace 기록
+        from api.langfuse_tracing import trace_chat, is_enabled as langfuse_enabled
+        if langfuse_enabled():
+            trace_chat(
+                trace_id=trace_id,
+                session_id=session_id,
+                user_id=ctx.user_id,
+                prompt=req.prompt,
+                response=response_text,
+                model=MODEL_ID,
+                input_tokens=token_usage.input_tokens,
+                output_tokens=token_usage.output_tokens,
+                latency_ms=latency_ms,
+                tools_used=tools_used,
+                cost_usd=cost_info["cost"]["total_cost"],
+                prompt_version=get_current_prompt_version(),
+            )
 
         return ChatResponse(
             response=response_text,
@@ -628,6 +711,15 @@ async def chat_stream(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
 
         started_at = time.time()
         final_event: Optional[dict] = None
+
+        # Publish trace_start event
+        trace_id = turn_id
+        publish_span_event("trace_start", {
+            "trace_id": trace_id,
+            "prompt": prompt[:120],
+            "model": MODEL_ID or "",
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+        })
         try:
             resp = _get_client().invoke_agent_runtime(**kwargs)
         except Exception as e:
@@ -724,13 +816,23 @@ async def chat_stream(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
 
         guardrail_passed = True
         guardrail_violations: list = []
+        guardrail_checks_run: list = []
+        guardrail_critical = 0
+        guardrail_warn = 0
+        guardrail_info = 0
         redacted = False
         if enable_guardrails and response_text:
             try:
                 g = validate_response(response_text)
                 guardrail_passed = g.passed
+                guardrail_checks_run = g.checks_run
+                guardrail_critical = g.critical_count
+                guardrail_warn = g.warn_count
+                guardrail_info = sum(1 for v in g.violations if v.severity.value == "info")
                 guardrail_violations = [{"rule_id": v.rule_id, "severity": v.severity.value,
-                                         "message": v.message} for v in g.violations]
+                                         "message": v.message,
+                                         "matched_text": v.matched_text[:80] if v.matched_text else None,
+                                         "suggestion": v.suggestion} for v in g.violations]
                 if any(v.severity.value == "critical" for v in g.violations):
                     redacted = True
             except Exception:
@@ -751,6 +853,7 @@ async def chat_stream(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
             snap = (final_event or {}).get("llm_gateway_snapshot")
             if snap:
                 _merge_llm_gateway_snapshot(snap)
+                get_persistence().persist_llm_gateway(_llm_gateway_acc)
         except Exception:
             pass
 
@@ -770,11 +873,47 @@ async def chat_stream(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
                 "prompt_version": prompt_version,
                 "guardrails_passed": guardrail_passed,
             })
+            get_persistence().persist_chat(_chat_history[-1])
+        except Exception:
+            pass
+
+        # User/Team 사용량 기록 (스트리밍 경로)
+        try:
+            input_tok = int(usage_d.get("input_tokens", 0))
+            output_tok = int(usage_d.get("output_tokens", 0))
+            # Runtime이 토큰을 반환하지 않으면 텍스트 길이로 추정
+            if input_tok == 0 and prompt:
+                input_tok = max(len(prompt) // 4, 1)
+            if output_tok == 0 and response_text:
+                output_tok = max(len(response_text) // 4, 1)
+            record_usage(UsageRecord(
+                user_id=ctx.user_id,
+                team_id=ctx.team_id,
+                timestamp=datetime.utcnow().isoformat(),
+                input_tokens=input_tok,
+                output_tokens=output_tok,
+                total_tokens=input_tok + output_tok,
+                cost_usd=cost_info.get("cost", {}).get("total_cost", 0) if cost_info else 0,
+                model=MODEL_ID,
+                tools_used=tools_used,
+                prompt_version=prompt_version,
+                session_id=session_id,
+                trace_id=(final_event or {}).get("otel_trace_id") or turn_id,
+                latency_ms=int(latency_ms),
+            ))
         except Exception:
             pass
 
         session.circuit_breaker.record_success()
         session.end_turn()
+        get_session_store().persist(session_id)
+
+        # Publish trace_end event
+        publish_span_event("trace_end", {
+            "trace_id": trace_id,
+            "total_duration_ms": round(latency_ms),
+            "final_status": "ok",
+        })
 
         # Final enriched event
         complete = {
@@ -784,7 +923,14 @@ async def chat_stream(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
             "trace_id": (final_event or {}).get("otel_trace_id") or turn_id,
             "latency_ms": latency_ms,
             "cost": cost_info.get("cost", {}) if cost_info else {},
-            "guardrails": {"passed": guardrail_passed, "violations": guardrail_violations},
+            "guardrails": {
+                "passed": guardrail_passed,
+                "critical_count": guardrail_critical,
+                "warn_count": guardrail_warn,
+                "info_count": guardrail_info,
+                "checks_run": guardrail_checks_run,
+                "violations": guardrail_violations,
+            },
             "redacted": redacted,
             "circuit_state": session.circuit_breaker.state.value,
         }
@@ -795,7 +941,7 @@ async def chat_stream(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # disable nginx buffering if fronted
+            "X-Accel-Buffering": "no",
             "X-Session-Id": session_id,
             "X-Turn-Id": turn_id,
         },
@@ -803,9 +949,12 @@ async def chat_stream(req: ChatRequest, ctx: UserCtx = Depends(get_user_ctx)):
 
 
 @app.get("/traces")
-def list_traces(limit: int = Query(20, ge=1, le=200)):
+def list_traces(
+    limit: int = Query(20, ge=1, le=200),
+    hours: int = Query(6, ge=1, le=168),
+):
     """최근 트레이스 (턴) 목록. OTEL + chat_history 병합."""
-    traces = cw_helper.get_recent_traces(limit)
+    traces = cw_helper.get_recent_traces(limit, hours=hours)
     for t in traces:
         chat = _match_chat_for_trace(t)
         if chat:
@@ -837,6 +986,34 @@ def get_trace(trace_id: str):
     return detail
 
 
+@app.get("/traces/stream")
+async def stream_traces():
+    """SSE endpoint for real-time trace/span events."""
+    queue = subscribe_span_events()
+
+    async def event_generator():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield f"event: {event['type']}\ndata: {json.dumps(event['data'])}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            unsubscribe_span_events(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/agents")
 def list_agents():
     """사용 가능한 AgentCore Runtime 에이전트 목록."""
@@ -848,8 +1025,12 @@ def list_agents():
 def get_metrics(
     hours: int = Query(1, ge=1, le=168),
     agent_id: str = Query(None, description="Agent ID to filter metrics"),
+    user_id: str = Query(None, description="User ID to filter metrics (DynamoDB-based)"),
 ):
-    """집계 메트릭."""
+    """집계 메트릭. user_id 지정 시 해당 유저의 DynamoDB 사용 기록에서 집계."""
+    if user_id:
+        return _get_user_metrics(user_id, hours)
+
     base = cw_helper.get_aggregated_metrics(hours, agent_id=agent_id)
     global_cost = get_tracker().get_global_state()
     analytics_stats = get_queue().get_stats()
@@ -863,9 +1044,164 @@ def get_metrics(
     }
 
 
-@app.post("/evaluations")
+def _get_user_metrics(user_id: str, hours: int) -> dict:
+    """DynamoDB USAGE_TABLE에서 유저별 메트릭을 MetricsData 포맷으로 집계."""
+    from datetime import timedelta
+    from boto3.dynamodb.conditions import Key as DdbKey
+
+    cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    table = get_persistence()._usage_table()
+
+    try:
+        resp = table.query(
+            KeyConditionExpression=DdbKey("user_id").eq(user_id) & DdbKey("sort_key").gte(f"ts#{cutoff}"),
+            Limit=500,
+        )
+        items = resp.get("Items", [])
+    except Exception as e:
+        return {"error": str(e)[:200], "source": "dynamodb"}
+
+    if not items:
+        return {
+            "invocation_count": 0,
+            "latency": {"avg": 0, "p50": 0, "p99": 0, "values": []},
+            "tokens": {"total": 0, "input": 0, "output": 0, "avg_per_call": 0, "values": []},
+            "cost": {"total_usd": 0, "values": []},
+            "tool_calls": {},
+            "tool_durations": {},
+            "source": "dynamodb",
+            "user_id": user_id,
+        }
+
+    latencies = []
+    total_input = 0
+    total_output = 0
+    total_cost = 0.0
+    tool_counts: dict[str, int] = {}
+    latency_ts: list[dict] = []
+    token_ts: list[dict] = []
+    cost_ts: list[dict] = []
+
+    for item in items:
+        lat = int(item.get("latency_ms", 0) or 0)
+        inp = int(item.get("input_tokens", 0) or 0)
+        out = int(item.get("output_tokens", 0) or 0)
+        cost = float(item.get("cost_usd", 0) or 0)
+        ts = item.get("sort_key", "")[3:30] if item.get("sort_key", "").startswith("ts#") else ""
+
+        latencies.append(lat)
+        total_input += inp
+        total_output += out
+        total_cost += cost
+
+        tools = item.get("tools_used", set())
+        if isinstance(tools, set):
+            tools = list(tools)
+        for t in tools:
+            if t and t != "none":
+                tool_counts[t] = tool_counts.get(t, 0) + 1
+
+        if ts:
+            latency_ts.append({"timestamp": ts, "value": lat})
+            token_ts.append({"timestamp": ts, "value": inp + out})
+            cost_ts.append({"timestamp": ts, "value": cost})
+
+    n = len(items)
+    sorted_lat = sorted(latencies)
+    avg_lat = sum(latencies) / n if n else 0
+    p50 = sorted_lat[n // 2] if n else 0
+    p99 = sorted_lat[int(n * 0.99)] if n else 0
+    total_tokens = total_input + total_output
+
+    return {
+        "invocation_count": n,
+        "latency": {
+            "avg": round(avg_lat, 1),
+            "p50": round(p50, 1),
+            "p99": round(p99, 1),
+            "values": latency_ts[-20:],
+        },
+        "tokens": {
+            "total": total_tokens,
+            "input": total_input,
+            "output": total_output,
+            "avg_per_call": round(total_tokens / n) if n else 0,
+            "values": token_ts[-20:],
+        },
+        "cost": {
+            "total_usd": round(total_cost, 6),
+            "values": cost_ts[-20:],
+        },
+        "tool_calls": tool_counts,
+        "tool_durations": {},
+        "source": "dynamodb",
+        "user_id": user_id,
+    }
+
+
+@app.get("/evaluations/evaluators")
+def get_evaluators():
+    """사용 가능한 AgentCore 평가기 목록."""
+    import api.agentcore_evaluation as ac_eval
+    return {"evaluators": ac_eval.list_evaluators()}
+
+
+@app.get("/evaluations/online/configs")
+def get_online_configs():
+    """Online Evaluation Config 목록."""
+    import api.agentcore_evaluation as ac_eval
+    return {"configs": ac_eval.list_online_configs()}
+
+
+@app.get("/evaluations/online/config/{config_id}")
+def get_online_config_detail(config_id: str):
+    """Online Evaluation Config 상세."""
+    import api.agentcore_evaluation as ac_eval
+    return ac_eval.get_online_config(config_id)
+
+
+@app.post("/evaluations/online/config")
+def create_online_config(req: dict):
+    """Online Evaluation Config 생성."""
+    import api.agentcore_evaluation as ac_eval
+    name = req.get("name", "eval_config")
+    evaluator_ids = req.get("evaluator_ids", ["Builtin.Helpfulness", "Builtin.Correctness", "Builtin.GoalSuccessRate"])
+    sampling_rate = req.get("sampling_rate", 100.0)
+    description = req.get("description", "")
+    return ac_eval.create_online_config(name, evaluator_ids, sampling_rate, description)
+
+
+@app.put("/evaluations/online/config/{config_id}")
+def update_online_config(config_id: str, req: dict):
+    """Online Evaluation Config 수정."""
+    import api.agentcore_evaluation as ac_eval
+    return ac_eval.update_online_config(
+        config_id,
+        sampling_rate=req.get("sampling_rate"),
+        evaluator_ids=req.get("evaluator_ids"),
+        enabled=req.get("enabled"),
+    )
+
+
+@app.delete("/evaluations/online/config/{config_id}")
+def delete_online_config(config_id: str):
+    """Online Evaluation Config 삭제."""
+    import api.agentcore_evaluation as ac_eval
+    return ac_eval.delete_online_config(config_id)
+
+
+@app.get("/evaluations/online/results/{config_id}")
+def get_online_results(config_id: str, hours: int = Query(24, ge=1, le=720)):
+    """Online Evaluation 결과 조회 (CloudWatch Logs)."""
+    import api.agentcore_evaluation as ac_eval
+    return ac_eval.get_online_results(config_id, hours=hours)
+
+
+@app.post("/evaluations/run")
 def run_evaluation(req: EvalRequest):
-    """평가 실행 (EvaluationClient — CloudWatch 스팬 기반)."""
+    """On-demand 평가 실행 (단일 세션/트레이스)."""
+    import api.agentcore_evaluation as ac_eval
+
     session_id = req.session_id
     trace_id = req.trace_id
 
@@ -876,341 +1212,364 @@ def run_evaluation(req: EvalRequest):
             trace_id = last.get("otel_trace_id") or last.get("trace_id", "")
 
     if not session_id:
-        raise HTTPException(status_code=400, detail="No session available for evaluation. Send a chat message first or provide session_id.")
+        traces = cw_helper.get_recent_traces(1)
+        if traces:
+            session_id = traces[0].get("session_id", "")
+            if not trace_id:
+                trace_id = traces[0].get("trace_id", "")
 
-    eval_results = _run_agentcore_evaluation(req.evaluators, session_id, trace_id)
+    if not session_id:
+        raise HTTPException(status_code=400, detail="No session available. Send a chat message first or provide session_id.")
 
-    eval_entry = {
+    results = ac_eval.run_on_demand(
+        evaluator_ids=req.evaluators,
+        session_id=session_id,
+        trace_id=trace_id,
+        look_back_hours=req.lookback_days * 24,
+    )
+
+    return {
         "eval_id": str(uuid.uuid4()),
         "timestamp": datetime.utcnow().isoformat(),
-        "prompt_version": get_current_prompt_version(),
-        "evaluators": req.evaluators,
-        "results": eval_results,
         "session_id": session_id,
         "trace_id": trace_id or "",
+        "results": results,
     }
-    _eval_history.append(eval_entry)
-
-    emit(Events.EVAL_RUN, evaluators=req.evaluators,
-         prompt_version=get_current_prompt_version(),
-         avg_score=round(sum(r["score"] for r in eval_results) / max(len(eval_results), 1), 3))
-
-    return eval_entry
 
 
-@app.get("/evaluations/history")
-def get_eval_history():
-    return {"history": _eval_history, "count": len(_eval_history)}
+@app.post("/evaluations/batch")
+def start_batch_evaluation(req: dict):
+    """Batch evaluation 시작."""
+    import api.agentcore_evaluation as ac_eval
+    name = req.get("name", f"batch_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}")
+    evaluator_ids = req.get("evaluator_ids", ["Builtin.Helpfulness", "Builtin.Correctness", "Builtin.GoalSuccessRate"])
+    return ac_eval.start_batch(name, evaluator_ids)
 
 
-@app.get("/evaluations/turn/{turn_id}")
-def get_turn_eval(turn_id: str):
-    """특정 턴의 자동 평가 결과."""
-    result = _turn_evals.get(turn_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="No evaluation for this turn")
+@app.get("/evaluations/batch")
+def list_batch_evaluations():
+    """Batch evaluation 목록."""
+    import api.agentcore_evaluation as ac_eval
+    return {"batches": ac_eval.list_batches()}
+
+
+@app.get("/evaluations/batch/{batch_id}")
+def get_batch_evaluation(batch_id: str):
+    """Batch evaluation 상세 + 결과."""
+    import api.agentcore_evaluation as ac_eval
+    detail = ac_eval.get_batch(batch_id)
+    if detail.get("status") == "COMPLETED" and not detail.get("results"):
+        results = ac_eval.get_batch_results(batch_id)
+        detail["results"] = results.get("results", [])
+        detail["results_summary"] = results.get("summary", {})
+    return detail
+
+
+# --- Optimization Endpoints (AgentCore Optimization API) ---
+
+
+@app.get("/optimization/status")
+def get_optimization_status():
+    """전체 optimization 파이프라인 상태 — history는 AgentCore API에서 조회."""
+    from api.agentcore_optimization import list_recommendations, list_bundles, list_bundle_versions
+
+    history = []
+    try:
+        recs = list_recommendations()
+        for r in recs:
+            history.append({
+                "type": "recommendation",
+                "id": r.get("recommendation_id", ""),
+                "name": r.get("name", ""),
+                "status": r.get("status", ""),
+                "timestamp": r.get("created_at", ""),
+            })
+
+        bundles = list_bundles()
+        active_bundle_id = _optimization_state.get("active_bundle_id")
+        if active_bundle_id:
+            try:
+                versions = list_bundle_versions(active_bundle_id)
+                for v in versions:
+                    history.append({
+                        "type": "bundle_version",
+                        "bundle_id": active_bundle_id,
+                        "version_id": v.get("version_id", ""),
+                        "commit_message": v.get("commit_message", ""),
+                        "timestamp": v.get("created_at", ""),
+                    })
+            except Exception:
+                pass
+
+        history = [h for h in history if h.get("timestamp")]
+        history.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+    except Exception as e:
+        history = [{"type": "error", "message": str(e)}]
+
+    return {**_optimization_state, "history": history}
+
+
+@app.post("/optimization/recommendations")
+def create_recommendation_endpoint(req: dict = Body(...)):
+    """추천 생성 — trace 분석 시작."""
+    from api.agentcore_optimization import start_recommendation
+    from agent.system_prompt import get_prompt
+
+    evaluator_id = req.get("evaluator_id", "Builtin.GoalSuccessRate")
+    lookback_days = req.get("lookback_days", 7)
+    current_prompt = get_prompt(get_current_prompt_version())
+
+    name = f"rec-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}"
+
+    result = start_recommendation(
+        name=name,
+        evaluator_id=evaluator_id,
+        current_prompt=current_prompt,
+        lookback_days=lookback_days,
+    )
+
+    _optimization_state["stage"] = "recommending"
+    _optimization_state["active_recommendation"] = result
+    get_persistence().persist_optimization_state(_optimization_state)
+
     return result
 
 
-@app.get("/evaluations/turns")
-def get_all_turn_evals():
-    """전체 턴별 평가 결과 + 트렌드."""
-    trend = []
-    for tid in _turn_eval_order:
-        ev = _turn_evals.get(tid)
-        if ev:
-            trend.append({
-                "turn_id": tid,
-                "avg_score": ev["avg_score"],
-                "prompt_version": ev["prompt_version"],
-                "timestamp": ev["timestamp"],
-                "eval_source": ev.get("eval_source", "agentcore"),
-            })
-    return {"turn_evals": _turn_evals, "trend": trend, "count": len(trend)}
+@app.get("/optimization/recommendations")
+def list_recommendations_endpoint():
+    """추천 목록 조회."""
+    from api.agentcore_optimization import list_recommendations
+    return {"recommendations": list_recommendations()}
 
 
-@app.get("/improvement")
-def get_improvement_state():
-    """개선 파이프라인 상태."""
-    return _improvement_state
+@app.get("/optimization/recommendations/{recommendation_id}")
+def get_recommendation_endpoint(recommendation_id: str):
+    """특정 추천 상세 조회."""
+    from api.agentcore_optimization import get_recommendation
+
+    result = get_recommendation(recommendation_id)
+
+    if _optimization_state.get("stage") == "recommending":
+        if result.get("status") == "COMPLETED":
+            _optimization_state["stage"] = "recommended"
+            _optimization_state["active_recommendation"] = result
+            get_persistence().persist_optimization_state(_optimization_state)
+        elif result.get("status") == "FAILED":
+            _optimization_state["stage"] = "idle"
+            _optimization_state["active_recommendation"] = result
+            get_persistence().persist_optimization_state(_optimization_state)
+
+    return result
 
 
-@app.post("/improvement/apply")
-def apply_improvement():
-    """제안된 개선 적용."""
-    if _improvement_state["status"] != "ready":
-        raise HTTPException(status_code=400, detail="No improvement suggestion ready")
+@app.post("/optimization/bundles")
+def create_bundle_endpoint(req: dict = Body(...)):
+    """Configuration Bundle 생성."""
+    from api.agentcore_optimization import create_bundle
 
-    suggestion = _improvement_state["suggestion"]
-    new_version = suggestion["suggested_version"]
+    bundle_name = req.get("bundle_name", "")
+    system_prompt = req.get("system_prompt", "")
+    description = req.get("description", "")
 
-    if not set_prompt_version(new_version):
-        raise HTTPException(status_code=400, detail=f"Cannot switch to {new_version}")
+    if not bundle_name or not system_prompt:
+        raise HTTPException(status_code=400, detail="bundle_name and system_prompt required")
 
-    _improvement_state["status"] = "applied"
-    _improvement_state["before_score"] = _improvement_state.get("trigger_score")
+    return create_bundle(bundle_name, system_prompt, description)
 
-    emit(Events.PROMPT_VERSION_CHANGE, new_version=new_version)
+
+@app.get("/optimization/bundles")
+def list_bundles_endpoint():
+    """Configuration Bundle 목록."""
+    from api.agentcore_optimization import list_bundles
+    return {"bundles": list_bundles()}
+
+
+@app.get("/optimization/bundles/{bundle_id}")
+def get_bundle_endpoint(bundle_id: str, version_id: Optional[str] = None):
+    """Configuration Bundle 상세."""
+    from api.agentcore_optimization import get_bundle
+    return get_bundle(bundle_id, version_id)
+
+
+@app.get("/optimization/bundles/{bundle_id}/versions")
+def list_bundle_versions_endpoint(bundle_id: str):
+    """Configuration Bundle 버전 목록."""
+    from api.agentcore_optimization import list_bundle_versions
+    return {"versions": list_bundle_versions(bundle_id)}
+
+
+_ab_test_state: Optional[dict] = None
+
+
+@app.post("/optimization/ab-tests")
+def create_ab_test_endpoint(req: dict = Body(...)):
+    """A/B 테스트 생성 — Gateway traffic split via Configuration Bundle variants."""
+    global _ab_test_state
+    from agent.system_prompt import get_prompt
+
+    control_weight = req.get("control_weight", 80)
+    treatment_weight = req.get("treatment_weight", 20)
+    treatment_prompt = req.get("treatment_prompt", "")
+    control_version = req.get("control_version", get_current_prompt_version())
+
+    if not treatment_prompt:
+        rec = _optimization_state.get("active_recommendation") or {}
+        treatment_prompt = rec.get("recommended_prompt", "")
+    if not treatment_prompt:
+        raise HTTPException(status_code=400, detail="treatment_prompt required or run recommendation first")
+
+    test_id = f"ab-{uuid.uuid4().hex[:8]}"
+    _ab_test_state = {
+        "rule_id": test_id,
+        "status": "RUNNING",
+        "control": {"version": control_version, "prompt": get_prompt(control_version), "weight": control_weight},
+        "treatment": {"version": "recommended", "prompt": treatment_prompt, "weight": treatment_weight},
+        "stats": {"control_count": 0, "treatment_count": 0},
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    _optimization_state["stage"] = "testing"
+    _optimization_state["active_test"] = {
+        "rule_id": test_id,
+        "status": "RUNNING",
+        "control_weight": control_weight,
+        "treatment_weight": treatment_weight,
+        "created_at": _ab_test_state["created_at"],
+    }
+    get_persistence().persist_optimization_state(_optimization_state)
+
+    return _optimization_state["active_test"]
+
+
+@app.post("/optimization/ab-tests/{rule_id}/complete")
+def complete_ab_test_endpoint(rule_id: str, req: dict = Body(...)):
+    """A/B 테스트 종료 + winner 배포."""
+    global _ab_test_state
+    from agent.system_prompt import PROMPT_VERSIONS
+
+    winner = req.get("winner", "treatment")
+
+    if winner == "treatment" and _ab_test_state:
+        treatment_prompt = _ab_test_state["treatment"]["prompt"]
+        version_key = f"v{len(PROMPT_VERSIONS) + 1}"
+        PROMPT_VERSIONS[version_key] = treatment_prompt
+        set_prompt_version(version_key)
+        emit(Events.PROMPT_VERSION_CHANGE, new_version=version_key)
+
+    _ab_test_state = None
+    _optimization_state["stage"] = "complete"
+    _optimization_state["active_test"] = None
+    get_persistence().persist_optimization_state(_optimization_state)
+
+    return {"status": "completed", "winner": winner, "rule_id": rule_id}
+
+
+@app.post("/optimization/apply")
+def apply_recommendation_endpoint(req: dict = Body(...)):
+    """추천 프롬프트를 Configuration Bundle로 저장하고 에이전트에 적용."""
+    from api.agentcore_optimization import create_bundle, update_bundle
+    from agent.system_prompt import PROMPT_VERSIONS
+
+    recommended_prompt = req.get("system_prompt", "")
+    recommendation_id = req.get("recommendation_id", "")
+    if not recommended_prompt:
+        raise HTTPException(status_code=400, detail="system_prompt required")
+
+    active_bundle_id = _optimization_state.get("active_bundle_id")
+    if active_bundle_id:
+        result = update_bundle(
+            bundle_id=active_bundle_id,
+            system_prompt=recommended_prompt,
+            commit_message=f"Applied recommendation {recommendation_id}",
+        )
+    else:
+        result = create_bundle(
+            bundle_name="agent_prompt_" + _RUNTIME_NAME.replace("-", "_"),
+            system_prompt=recommended_prompt,
+            description=f"Auto-created from recommendation {recommendation_id}",
+        )
+        _optimization_state["active_bundle_id"] = result.get("bundle_id", "")
+
+    prev_version = get_current_prompt_version()
+    version_key = f"v{len(PROMPT_VERSIONS) + 1}"
+    PROMPT_VERSIONS[version_key] = recommended_prompt
+    set_prompt_version(version_key)
+    emit(Events.PROMPT_VERSION_CHANGE, new_version=version_key)
+
+    _optimization_state["stage"] = "applied"
+    _optimization_state["active_recommendation"] = {
+        **(_optimization_state.get("active_recommendation") or {}),
+        "bundle_id": result.get("bundle_id", _optimization_state.get("active_bundle_id", "")),
+        "bundle_arn": result.get("bundle_arn", ""),
+        "bundle_version": result.get("version_id", ""),
+        "applied_version": version_key,
+    }
+    get_persistence().persist_optimization_state(_optimization_state)
 
     return {
         "status": "applied",
-        "previous_version": suggestion["current_version"],
-        "new_version": new_version,
-        "before_score": _improvement_state["before_score"],
+        "version": version_key,
+        "version_from": prev_version,
+        "bundle_id": result.get("bundle_id", ""),
+        "bundle_arn": result.get("bundle_arn", ""),
+        "bundle_version": result.get("version_id", ""),
     }
 
 
-@app.post("/improvement/reset")
-def reset_improvement():
-    """개선 파이프라인 초기화."""
-    _improvement_state.update({
-        "status": "idle",
-        "trigger_score": None,
-        "suggestion": None,
-        "before_score": None,
-        "after_score": None,
+@app.post("/optimization/deploy")
+def deploy_winner_endpoint(req: dict = Body(...)):
+    """Winner 프롬프트를 active로 배포 (직접 배포 또는 A/B 테스트 후 배포)."""
+    new_prompt = req.get("system_prompt", "")
+    version_label = req.get("version_label", "")
+
+    if not new_prompt:
+        raise HTTPException(status_code=400, detail="system_prompt required")
+
+    from api.agentcore_optimization import create_bundle, update_bundle
+    from agent.system_prompt import PROMPT_VERSIONS
+
+    active_bundle_id = _optimization_state.get("active_bundle_id")
+    if active_bundle_id:
+        update_bundle(
+            bundle_id=active_bundle_id,
+            system_prompt=new_prompt,
+            commit_message=f"Deploy winner: {version_label or 'direct'}",
+        )
+    else:
+        result = create_bundle(
+            bundle_name="agent_prompt_" + _RUNTIME_NAME.replace("-", "_"),
+            system_prompt=new_prompt,
+            description="Deployed via optimization pipeline",
+        )
+        _optimization_state["active_bundle_id"] = result.get("bundle_id", "")
+
+    version_key = version_label or f"v{len(PROMPT_VERSIONS) + 1}"
+    PROMPT_VERSIONS[version_key] = new_prompt
+    set_prompt_version(version_key)
+    emit(Events.PROMPT_VERSION_CHANGE, new_version=version_key)
+
+    _optimization_state["stage"] = "idle"
+    get_persistence().persist_optimization_state(_optimization_state)
+    return {"status": "deployed", "version": version_key}
+
+
+@app.post("/optimization/reset")
+def reset_optimization():
+    """Optimization 파이프라인 초기화."""
+    global _ab_test_state
+    _ab_test_state = None
+    _optimization_state.update({
+        "stage": "idle",
+        "active_recommendation": None,
+        "active_test": None,
     })
+    get_persistence().persist_optimization_state(_optimization_state)
     return {"status": "idle"}
 
 
 # --- Evaluation Analysis Endpoints ---
 
 
-@app.get("/evaluations/analysis")
-def get_eval_analysis(threshold: float = Query(0.65, ge=0.0, le=1.0)):
-    """통합 평가 분석 — 카테고리별, 평가자별, 시간 트렌드, 도구 상관관계, 저점수 분석."""
-    by_category: dict[str, dict] = {}
-    by_evaluator: dict[str, dict] = {}
-    time_trend: list[dict] = []
-    tool_scores: dict[str, list[float]] = {}
-    tool_counts: dict[str, int] = {}
-    low_score_turns: list[dict] = []
-
-    for tid in _turn_eval_order:
-        ev = _turn_evals.get(tid)
-        if not ev:
-            continue
-
-        cat = ev.get("category", "general")
-        if cat not in by_category:
-            by_category[cat] = {"count": 0, "total_score": 0.0, "evaluator_totals": {}, "evaluator_counts": {}}
-        bc = by_category[cat]
-        bc["count"] += 1
-        bc["total_score"] += ev["avg_score"]
-        for s in ev["scores"]:
-            name = s["evaluator"]
-            bc["evaluator_totals"][name] = bc["evaluator_totals"].get(name, 0.0) + s["score"]
-            bc["evaluator_counts"][name] = bc["evaluator_counts"].get(name, 0) + 1
-
-        for s in ev["scores"]:
-            name = s["evaluator"]
-            if name not in by_evaluator:
-                by_evaluator[name] = {"total": 0.0, "count": 0, "trend": [], "lowest_score": 1.0, "lowest_turn": None}
-            be = by_evaluator[name]
-            be["total"] += s["score"]
-            be["count"] += 1
-            be["trend"].append(round(s["score"], 3))
-            if s["score"] < be["lowest_score"]:
-                be["lowest_score"] = s["score"]
-                be["lowest_turn"] = {
-                    "turn_id": tid,
-                    "score": s["score"],
-                    "prompt": ev.get("prompt", "")[:200],
-                    "response": ev.get("response", "")[:300],
-                }
-
-        time_trend.append({
-            "turn_id": tid,
-            "timestamp": ev["timestamp"],
-            "avg_score": ev["avg_score"],
-            "prompt_version": ev["prompt_version"],
-            "category": cat,
-        })
-
-        for tool in ev.get("tools_used", []):
-            tool_scores.setdefault(tool, []).append(ev["avg_score"])
-            tool_counts[tool] = tool_counts.get(tool, 0) + 1
-
-        if ev["avg_score"] < threshold:
-            weakest = min(ev["scores"], key=lambda s: s["score"]) if ev["scores"] else None
-            low_score_turns.append({
-                "turn_id": tid,
-                "avg_score": ev["avg_score"],
-                "prompt": ev.get("prompt", "")[:200],
-                "response": ev.get("response", "")[:500],
-                "category": cat,
-                "tools_used": ev.get("tools_used", []),
-                "scores": ev["scores"],
-                "weakest_evaluator": weakest["evaluator"] if weakest else None,
-                "prompt_version": ev["prompt_version"],
-                "timestamp": ev["timestamp"],
-            })
-
-    categories_out = {}
-    for cat, data in by_category.items():
-        evaluator_scores = {}
-        for name, total in data["evaluator_totals"].items():
-            evaluator_scores[name] = round(total / max(data["evaluator_counts"][name], 1), 3)
-        categories_out[cat] = {
-            "count": data["count"],
-            "avg_score": round(data["total_score"] / max(data["count"], 1), 3),
-            "evaluator_scores": evaluator_scores,
-        }
-
-    evaluators_out = {}
-    for name, data in by_evaluator.items():
-        evaluators_out[name] = {
-            "avg_score": round(data["total"] / max(data["count"], 1), 3),
-            "count": data["count"],
-            "trend": data["trend"][-20:],
-            "lowest": data["lowest_turn"],
-        }
-
-    tool_correlation = {}
-    for tool, scores_list in tool_scores.items():
-        tool_correlation[tool] = {
-            "avg_score_when_used": round(sum(scores_list) / max(len(scores_list), 1), 3),
-            "call_count": tool_counts[tool],
-        }
-
-    trend_scores = [t["avg_score"] for t in time_trend]
-    improving = False
-    delta = 0.0
-    if len(trend_scores) >= 3:
-        first_half = sum(trend_scores[:len(trend_scores)//2]) / max(len(trend_scores)//2, 1)
-        second_half = sum(trend_scores[len(trend_scores)//2:]) / max(len(trend_scores) - len(trend_scores)//2, 1)
-        delta = round(second_half - first_half, 3)
-        improving = delta > 0.02
-
-    # Why-low heuristic analysis for each low-score turn
-    for lt in low_score_turns:
-        lt["analysis"] = _analyze_low_scores(lt["scores"])
-
-    return {
-        "by_category": categories_out,
-        "by_evaluator": evaluators_out,
-        "time_trend": time_trend,
-        "tool_correlation": tool_correlation,
-        "low_score_turns": sorted(low_score_turns, key=lambda x: x["avg_score"])[:10],
-        "summary": {"improving": improving, "delta": delta, "total_turns": len(time_trend)},
-        "custom_evaluator": {
-            "registered": _custom_evaluator_id is not None,
-            "evaluator_id": _custom_evaluator_id,
-        },
-    }
-
-
-_WHY_LOW_RULES: dict[str, dict[str, str]] = {
-    "Builtin.Correctness": {
-        "analysis": "Response may lack specific numerical data or contain inaccurate figures.",
-        "recommendation": "Add structured guidelines for numerical data format (BRL values, percentages, counts).",
-    },
-    "Builtin.Faithfulness": {
-        "analysis": "Response may not be grounded in tool results or includes fabricated data.",
-        "recommendation": "Ensure the prompt instructs the agent to only cite data returned by tools.",
-    },
-    "Builtin.ToolSelectionAccuracy": {
-        "analysis": "Wrong tools may have been selected for this query type.",
-        "recommendation": "Add explicit tool-selection guidance in the system prompt for each query category.",
-    },
-    "Builtin.Helpfulness": {
-        "analysis": "Response may be too generic or miss the user's specific question.",
-        "recommendation": "Add few-shot examples showing ideal responses for each question category.",
-    },
-    "Builtin.Conciseness": {
-        "analysis": "Response is overly verbose or includes unnecessary preamble.",
-        "recommendation": "Add output format constraints: lead with the answer, then provide supporting data.",
-    },
-    "Builtin.GoalSuccessRate": {
-        "analysis": "The agent may not have fully addressed the user's intent.",
-        "recommendation": "Add explicit goal-checking step: verify the response answers the original question.",
-    },
-}
-
-
-def _analyze_low_scores(scores: list[dict]) -> dict:
-    """낮은 점수에 대한 휴리스틱 분석."""
-    if not scores:
-        return {"summary": "No scores available.", "details": [], "recommendations": []}
-
-    low_scores = sorted(scores, key=lambda s: s["score"])
-    details = []
-    recommendations = []
-    for s in low_scores:
-        if s["score"] < 0.65:
-            rule = _WHY_LOW_RULES.get(s["evaluator"], {})
-            details.append({
-                "evaluator": s["evaluator"],
-                "score": s["score"],
-                "analysis": rule.get("analysis", "Score below threshold."),
-            })
-            rec = rule.get("recommendation")
-            if rec and rec not in recommendations:
-                recommendations.append(rec)
-
-    weakest = low_scores[0]
-    summary = f"Weakest: {weakest['evaluator'].replace('Builtin.', '')} ({weakest['score']:.0%}). "
-    if len(details) > 1:
-        summary += f"{len(details)} evaluators below threshold."
-    return {"summary": summary, "details": details, "recommendations": recommendations}
-
-
-# --- Custom Evaluator Registration ---
-
-
-def _register_custom_evaluator() -> Optional[str]:
-    """custom_evaluator.json을 AgentCore에 등록."""
-    global _custom_evaluator_id
-    config_path = Path(__file__).resolve().parent.parent / "evaluation" / "custom_evaluator.json"
-    if not config_path.exists():
-        print("[custom-eval] custom_evaluator.json not found, skipping registration")
-        return None
-
-    try:
-        config = json.loads(config_path.read_text())
-        client = boto3.client("bedrock-agentcore", region_name=os.getenv("AGENTCORE_REGION", "us-east-1"))
-        resp = client.create_evaluator(
-            evaluatorName="ecommerce-analytics-quality",
-            description="E-commerce analytics response quality evaluator (LLM-as-a-Judge)",
-            evaluatorConfig=config,
-        )
-        _custom_evaluator_id = resp.get("evaluatorId")
-        print(f"[custom-eval] registered: {_custom_evaluator_id}")
-        return _custom_evaluator_id
-    except client.exceptions.ConflictException:
-        print("[custom-eval] already registered, fetching existing")
-        try:
-            resp = client.get_evaluator(evaluatorName="ecommerce-analytics-quality")
-            _custom_evaluator_id = resp.get("evaluatorId")
-            return _custom_evaluator_id
-        except Exception as e:
-            print(f"[custom-eval] fetch failed: {e}")
-            return None
-    except Exception as e:
-        print(f"[custom-eval] registration failed (non-critical): {e}")
-        return None
-
-
-@app.post("/evaluations/custom/register")
-def register_custom_evaluator():
-    """커스텀 평가자 수동 등록."""
-    eid = _register_custom_evaluator()
-    config_path = Path(__file__).resolve().parent.parent / "evaluation" / "custom_evaluator.json"
-    config_summary = {}
-    if config_path.exists():
-        config = json.loads(config_path.read_text())
-        scale = config.get("llmAsAJudge", {}).get("ratingScale", {}).get("numerical", [])
-        config_summary = {
-            "model": config.get("llmAsAJudge", {}).get("modelConfig", {}).get("bedrockEvaluatorModelConfig", {}).get("modelId"),
-            "scale_points": len(scale),
-        }
-    return {"registered": eid is not None, "evaluator_id": eid, "config": config_summary}
-
-
-@app.get("/evaluations/custom/status")
-def get_custom_evaluator_status():
-    """커스텀 평가자 등록 상태."""
-    return {"registered": _custom_evaluator_id is not None, "evaluator_id": _custom_evaluator_id}
 
 
 @app.put("/system-prompt")
@@ -1229,6 +1588,23 @@ def update_system_prompt(req: PromptUpdateRequest):
 def get_system_prompt():
     from agent.system_prompt import get_prompt
     version = get_current_prompt_version()
+    return {"version": version, "prompt": get_prompt(version)}
+
+
+@app.get("/system-prompt/versions")
+def list_prompt_versions():
+    from agent.system_prompt import PROMPT_VERSIONS
+    return {
+        "current": get_current_prompt_version(),
+        "versions": sorted(PROMPT_VERSIONS.keys()),
+    }
+
+
+@app.get("/system-prompt/{version}")
+def get_prompt_by_version(version: str):
+    from agent.system_prompt import PROMPT_VERSIONS, get_prompt
+    if version not in PROMPT_VERSIONS:
+        raise HTTPException(status_code=404, detail=f"Version {version} not found")
     return {"version": version, "prompt": get_prompt(version)}
 
 
@@ -1455,7 +1831,7 @@ def get_tool_gateway():
         import boto3
         cp = boto3.client("bedrock-agentcore-control", region_name=os.getenv("AWS_REGION", "us-east-1"))
         gateways = cp.list_gateways().get("items", [])
-        gw = next((g for g in gateways if g["name"] == "agentops-ecommerce-gateway"), None)
+        gw = next((g for g in gateways if g["name"] == _GATEWAY_NAME), None)
         if not gw:
             return {
                 "error": "gateway_not_found",
@@ -1465,7 +1841,7 @@ def get_tool_gateway():
             }
         gid = gw["gatewayId"]
         targets = cp.list_gateway_targets(gatewayIdentifier=gid).get("items", [])
-        target = next((t for t in targets if t["name"] == "EcommerceAnalyticsTools"), None)
+        target = next((t for t in targets if t["name"] == _GATEWAY_TARGET_NAME), None)
 
         # 도구 스키마는 target config에서 가져옴
         tools_info = []
@@ -1533,6 +1909,19 @@ def get_user_detail(user_id: str, days: int = Query(30, ge=1, le=90)):
     entry = get_directory_entry("user", user_id)
     usage = get_user_usage(user_id, days=days)
     budget = get_budget_state("user", user_id)
+    if not entry:
+        team_id = ""
+        if usage.get("recent_calls"):
+            team_id = usage["recent_calls"][-1].get("team_id", "")
+        entry = {
+            "entity_id": user_id,
+            "entity_type": "user",
+            "name": user_id,
+            "team_id": team_id,
+            "role": "",
+            "email": "",
+            "created_at": "",
+        }
     return {"directory": entry, "usage": usage, "budget": budget}
 
 
@@ -1569,7 +1958,7 @@ def get_registry():
     """AgentCore Registry 현황 — 등록된 에이전트/MCP 서버 목록."""
     try:
         import boto3
-        region = os.getenv("AWS_REGION", "us-east-1")
+        region = os.getenv("REGISTRY_REGION", "us-east-1")
         registry_id = os.getenv("REGISTRY_ID")
         if not registry_id:
             return {"error": "registry_not_configured", "records": []}
@@ -1578,14 +1967,21 @@ def get_registry():
         resp = c.list_registry_records(registryId=registry_id, maxResults=50)
         records_raw = resp.get("registryRecords", resp.get("items", []))
 
+        status_map = {"PENDING_APPROVAL": "SUBMITTED"}
+        a2a_agents = _get_a2a_names()
         records = []
         for r in records_raw:
+            raw_status = r.get("status", "")
+            name = r.get("name", "")
+            dtype = r.get("descriptorType", "")
+            if dtype == "CUSTOM" and name in a2a_agents:
+                dtype = "A2A"
             records.append({
                 "record_id": r.get("recordId"),
-                "name": r.get("name"),
+                "name": name,
                 "description": r.get("description"),
-                "descriptor_type": r.get("descriptorType"),
-                "status": r.get("status"),
+                "descriptor_type": dtype,
+                "status": status_map.get(raw_status, raw_status),
                 "created_at": r.get("createdAt").isoformat() if r.get("createdAt") else None,
                 "updated_at": r.get("updatedAt").isoformat() if r.get("updatedAt") else None,
             })
@@ -1617,6 +2013,248 @@ def get_registry():
         return {"error": str(e)[:300], "records": []}
 
 
+class RegistryPublishRequest(BaseModel):
+    name: str
+    description: str
+    descriptor_type: str = Field(description="MCP | A2A | CUSTOM | AGENT_SKILLS")
+    descriptor_url: Optional[str] = None
+
+
+@app.post("/registry/records")
+def publish_registry_record(req: RegistryPublishRequest):
+    """레지스트리에 새 레코드 생성 + 자동 제출."""
+    region = os.getenv("REGISTRY_REGION", "us-east-1")
+    registry_id = os.getenv("REGISTRY_ID")
+    if not registry_id:
+        raise HTTPException(status_code=400, detail="REGISTRY_ID not configured")
+
+    c = boto3.client("bedrock-agentcore-control", region_name=region)
+
+    server_content = json.dumps({
+        "name": f"agentops/{req.name}",
+        "description": req.description,
+        "version": "1.0.0",
+    })
+
+    actual_type = req.descriptor_type if req.descriptor_type == "MCP" else "CUSTOM"
+    create_params: dict = {
+        "registryId": registry_id,
+        "name": req.name,
+        "description": req.description,
+        "descriptorType": actual_type,
+        "recordVersion": "1.0",
+    }
+    if req.descriptor_type == "MCP":
+        create_params["descriptors"] = {
+            "mcp": {"server": {"inlineContent": server_content}}
+        }
+    else:
+        create_params["descriptors"] = {
+            "custom": {"inlineContent": server_content}
+        }
+
+    resp = c.create_registry_record(**create_params)
+    record_id = resp.get("recordId") or resp.get("recordArn", "").split("/")[-1]
+
+    # 레코드가 CREATING → DRAFT 전환 후 submit 가능. 최대 10초 대기.
+    import time as _time
+    for _ in range(5):
+        _time.sleep(2)
+        try:
+            c.submit_registry_record_for_approval(registryId=registry_id, recordId=record_id)
+            return {"record_id": record_id, "status": "SUBMITTED", "name": req.name}
+        except c.exceptions.ConflictException:
+            continue
+        except Exception:
+            break
+
+    return {"record_id": record_id, "status": "DRAFT", "name": req.name}
+
+
+@app.put("/registry/records/{record_id}/approve")
+def approve_registry_record(record_id: str):
+    """큐레이터가 레코드 승인."""
+    region = os.getenv("REGISTRY_REGION", "us-east-1")
+    registry_id = os.getenv("REGISTRY_ID")
+    if not registry_id:
+        raise HTTPException(status_code=400, detail="REGISTRY_ID not configured")
+
+    c = boto3.client("bedrock-agentcore-control", region_name=region)
+    c.update_registry_record_status(registryId=registry_id, recordId=record_id, status="APPROVED", statusReason="Curator approved")
+    return {"record_id": record_id, "status": "APPROVED"}
+
+
+@app.put("/registry/records/{record_id}/reject")
+def reject_registry_record(record_id: str):
+    """큐레이터가 레코드 거부."""
+    region = os.getenv("REGISTRY_REGION", "us-east-1")
+    registry_id = os.getenv("REGISTRY_ID")
+    if not registry_id:
+        raise HTTPException(status_code=400, detail="REGISTRY_ID not configured")
+
+    c = boto3.client("bedrock-agentcore-control", region_name=region)
+    c.update_registry_record_status(registryId=registry_id, recordId=record_id, status="REJECTED", statusReason="Curator rejected")
+    return {"record_id": record_id, "status": "REJECTED"}
+
+
+@app.put("/registry/records/{record_id}/deprecate")
+def deprecate_registry_record(record_id: str):
+    """레코드 폐기 — 더 이상 검색 불가."""
+    region = os.getenv("REGISTRY_REGION", "us-east-1")
+    registry_id = os.getenv("REGISTRY_ID")
+    if not registry_id:
+        raise HTTPException(status_code=400, detail="REGISTRY_ID not configured")
+
+    c = boto3.client("bedrock-agentcore-control", region_name=region)
+    c.update_registry_record_status(registryId=registry_id, recordId=record_id, status="DEPRECATED", statusReason="Deprecated by curator")
+    return {"record_id": record_id, "status": "DEPRECATED"}
+
+
+class RegistrySearchRequest(BaseModel):
+    query: str
+    max_results: int = 10
+
+
+@app.post("/registry/search")
+def search_registry(req: RegistrySearchRequest):
+    """시맨틱+키워드 하이브리드 검색."""
+    region = os.getenv("REGISTRY_REGION", "us-east-1")
+    registry_id = os.getenv("REGISTRY_ID")
+    if not registry_id:
+        raise HTTPException(status_code=400, detail="REGISTRY_ID not configured")
+
+    c = boto3.client("bedrock-agentcore", region_name=region)
+    resp = c.search_registry_records(
+        registryIds=[registry_id],
+        searchQuery=req.query,
+        maxResults=req.max_results,
+    )
+    records_raw = resp.get("registryRecords", resp.get("items", []))
+
+    a2a_agents = _get_a2a_names()
+    records = []
+    for r in records_raw:
+        name = r.get("name", "")
+        dtype = r.get("descriptorType", "")
+        if dtype == "CUSTOM" and name in a2a_agents:
+            dtype = "A2A"
+        records.append({
+            "record_id": r.get("recordId"),
+            "name": name,
+            "description": r.get("description"),
+            "descriptor_type": dtype,
+            "status": r.get("status"),
+            "descriptor_url": r.get("descriptorUrl"),
+            "search_score": r.get("score"),
+            "created_at": r.get("createdAt").isoformat() if r.get("createdAt") else None,
+            "updated_at": r.get("updatedAt").isoformat() if r.get("updatedAt") else None,
+        })
+
+    return {"records": records, "query": req.query, "total": len(records)}
+
+
+@app.get("/registry/mcp-endpoint")
+def get_registry_mcp_endpoint():
+    """Registry MCP 엔드포인트 연결 상태."""
+    import urllib.request
+    region = os.getenv("REGISTRY_REGION", "us-east-1")
+    registry_id = os.getenv("REGISTRY_ID")
+    if not registry_id:
+        return {"error": "REGISTRY_ID not configured"}
+
+    c = boto3.client("bedrock-agentcore-control", region_name=region)
+    try:
+        reg = c.get_registry(registryId=registry_id)
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+    mcp_url = reg.get("mcpEndpoint", reg.get("mcpEndpointUrl", ""))
+    auth_type = reg.get("authorizerType", "IAM")
+
+    status = "disconnected"
+    if mcp_url:
+        try:
+            req = urllib.request.Request(mcp_url, method="HEAD")
+            urllib.request.urlopen(req, timeout=5)
+            status = "connected"
+        except Exception:
+            status = "disconnected"
+
+    return {
+        "url": mcp_url or "",
+        "auth_type": auth_type,
+        "status": status,
+        "last_checked": datetime.utcnow().isoformat(),
+    }
+
+
+_publishable_cache: dict = {"resources": [], "a2a_names": set(), "ts": 0}
+
+
+def _get_a2a_names() -> set[str]:
+    """캐시된 A2A 리소스 이름 세트 반환 (60초 TTL)."""
+    import time as _t
+    if _t.time() - _publishable_cache["ts"] > 60:
+        _, names = _discover_publishable_resources()
+        _publishable_cache["a2a_names"] = names
+        _publishable_cache["ts"] = _t.time()
+    return _publishable_cache["a2a_names"]
+
+
+def _discover_publishable_resources() -> tuple[list[dict], set[str]]:
+    """배포된 Agent Runtime + Gateway Target에서 등록 가능한 리소스를 동적으로 조회."""
+    region = os.getenv("REGISTRY_REGION", "us-east-1")
+    gateway_id = os.getenv("AGENTCORE_GATEWAY_ID", os.getenv("GATEWAY_ID", ""))
+    gateway_url = os.getenv("GATEWAY_URL", "")
+    resources: list[dict] = []
+    a2a_names: set[str] = set()
+
+    try:
+        c = boto3.client("bedrock-agentcore-control", region_name=region)
+
+        # Agent Runtimes → A2A
+        rt_resp = c.list_agent_runtimes(maxResults=20)
+        runtimes = rt_resp.get("agentRuntimes", rt_resp.get("agentRuntimeSummaries", []))
+        for r in runtimes:
+            name = r.get("agentRuntimeName", "")
+            if not name:
+                continue
+            resources.append({
+                "name": name,
+                "description": r.get("description") or f"AgentCore Runtime: {name}",
+                "type": "A2A",
+                "descriptor_url": None,
+            })
+            a2a_names.add(name)
+
+        # Gateway Targets → MCP tools
+        if gateway_id:
+            targets = c.list_gateway_targets(gatewayIdentifier=gateway_id, maxResults=20)
+            for t in targets.get("targets", targets.get("items", [])):
+                tid = t.get("targetId", "")
+                detail = c.get_gateway_target(gatewayIdentifier=gateway_id, targetId=tid)
+                tc = detail.get("targetConfiguration", {})
+                tools = tc.get("mcp", {}).get("lambda", {}).get("toolSchema", {}).get("inlinePayload", [])
+                for tool in tools:
+                    resources.append({
+                        "name": tool.get("name", ""),
+                        "description": tool.get("description", ""),
+                        "type": "MCP",
+                        "descriptor_url": gateway_url,
+                    })
+    except Exception:
+        pass
+
+    return resources, a2a_names
+
+
+@app.get("/registry/publishable")
+def get_publishable_resources():
+    """등록 가능한 기존 에이전트/MCP 도구 목록."""
+    resources, _ = _discover_publishable_resources()
+    return {"resources": resources}
+
+
 @app.get("/gateways/agent")
 def get_agent_gateway():
     """Agent Gateway 현황 — 등록된 에이전트 목록 + A2A 호출 이력."""
@@ -1628,12 +2266,12 @@ def get_agent_gateway():
         agents = []
         for rt in runtimes:
             name = rt.get("agentRuntimeName", "")
-            if name in ("ecommerce_analytics", "reviews_specialist", "logistics_specialist"):
+            if name in _AGENT_RUNTIME_NAMES:
                 agents.append({
                     "name": name,
                     "arn": rt.get("agentRuntimeArn"),
                     "status": rt.get("status"),
-                    "role": "main" if name == "ecommerce_analytics" else name.replace("_specialist", ""),
+                    "role": "main" if name == _MAIN_RUNTIME else name.replace("_specialist", ""),
                     "description": {
                         "main": "Orchestrator — routes complex queries to specialists",
                         "reviews": "Customer satisfaction / sentiment / review analysis",
@@ -1772,7 +2410,6 @@ def get_session_turns(session_id: str, limit: int = Query(50, ge=1, le=200)):
     turns = []
     for t in traces:
         turn_id = t.get("turn_id", "")
-        eval_data = _turn_evals.get(turn_id)
         turns.append({
             "turn_id": turn_id,
             "trace_id": t.get("trace_id", ""),
@@ -1785,10 +2422,7 @@ def get_session_turns(session_id: str, limit: int = Query(50, ge=1, le=200)):
             "cost": t.get("cost"),
             "prompt_version": t.get("prompt_version", ""),
             "status": t.get("status", "ok"),
-            "eval": {
-                "avg_score": eval_data["avg_score"],
-                "scores": eval_data.get("scores", []),
-            } if eval_data else None,
+            "eval": None,
         })
 
     session = get_session_store().get(session_id)
@@ -1804,210 +2438,6 @@ def get_session_turns(session_id: str, limit: int = Query(50, ge=1, le=200)):
 # --- Helper Functions ---
 
 
-def _run_agentcore_evaluation(evaluators: list[str], session_id: str, trace_id: str = "") -> list[dict]:
-    """AgentCore Evaluation API 호출 (EvaluationClient — CloudWatch 스팬 기반)."""
-    from datetime import timedelta
-    from bedrock_agentcore.evaluation.client import EvaluationClient
-
-    region = os.getenv("AGENTCORE_REGION", "us-east-1")
-    agent_id = os.getenv("AGENTCORE_AGENT_ID", "")
-
-    eval_client = EvaluationClient(region_name=region)
-    raw_results = eval_client.run(
-        evaluator_ids=evaluators,
-        session_id=session_id,
-        agent_id=agent_id if agent_id else None,
-        trace_id=trace_id.replace("-", "") if trace_id else None,
-        look_back_time=timedelta(minutes=15),
-    )
-
-    results = []
-    for r in raw_results:
-        score_val = r.get("value", 0.0)
-        if score_val is None:
-            continue
-        results.append({
-            "evaluator": r.get("evaluatorId", ""),
-            "score": score_val,
-            "label": _score_label(score_val),
-            "explanation": r.get("explanation", ""),
-            "eval_source": "agentcore",
-        })
-    return results
-
-
-def _score_label(score: float) -> str:
-    if score >= 0.85:
-        return "Excellent"
-    if score >= 0.7:
-        return "Very Good"
-    if score >= 0.5:
-        return "Good"
-    if score >= 0.3:
-        return "Fair"
-    return "Poor"
-
-
-# --- Auto-Evaluation (Online) ---
-
-_DEFAULT_EVALUATORS = [
-    "Builtin.Helpfulness",
-    "Builtin.Correctness",
-    "Builtin.GoalSuccessRate",
-    "Builtin.Faithfulness",
-    "Builtin.ToolSelectionAccuracy",
-    "Builtin.Conciseness",
-]
-
-_CATEGORY_KEYWORDS: dict[str, list[str]] = {
-    "sales": ["revenue", "sales", "order", "purchase", "transaction", "category", "product", "aov", "average order"],
-    "reviews": ["review", "rating", "satisfaction", "complaint", "star", "feedback", "score"],
-    "delivery": ["delivery", "shipping", "late", "on-time", "logistics", "carrier", "freight"],
-    "sellers": ["seller", "vendor", "merchant", "supplier", "ranking"],
-}
-
-
-def _infer_category(prompt: str) -> str:
-    lower = prompt.lower()
-    scores = {cat: sum(1 for kw in kws if kw in lower) for cat, kws in _CATEGORY_KEYWORDS.items()}
-    best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "general"
-
-_IMPROVEMENT_SUGGESTIONS = {
-    "v1": {
-        "current_version": "v1",
-        "suggested_version": "v2",
-        "changes": [
-            {"aspect": "Numerical Specificity", "before": "No guidance on data format", "after": "Always include BRL values, percentages, counts"},
-            {"aspect": "Data Breakdown", "before": "Generic responses", "after": "State-level, time-based breakdown required"},
-            {"aspect": "Business Insights", "before": "Not required", "after": "End with 1-2 actionable insights"},
-        ],
-        "expected_delta": "+27%",
-        "reason": "Low Correctness — agent responses lack grounded numerical data and structured breakdowns",
-    },
-    "v2": {
-        "current_version": "v2",
-        "suggested_version": "v3",
-        "changes": [
-            {"aspect": "Response Format", "before": "Free-form text", "after": "Markdown tables for rankings, bullets for breakdowns"},
-            {"aspect": "Few-Shot Guidance", "before": "No examples", "after": "One ideal Q&A pair as reference"},
-            {"aspect": "Edge Case Handling", "before": "No guidance", "after": "Explicit instructions for missing data periods"},
-        ],
-        "expected_delta": "+6%",
-        "reason": "Good but inconsistent formatting — structured output template and examples will improve consistency",
-    },
-}
-
-
-async def _auto_evaluate_turn(
-    turn_id: str, trace_id: str, prompt: str, response: str,
-    tools_used: Optional[list[str]] = None, session_id: str = "",
-):
-    """채팅 턴 후 비동기 자동 평가 (EvaluationClient — CloudWatch 스팬 기반)."""
-    await asyncio.sleep(30)
-
-    prompt_version = get_current_prompt_version()
-    category = _infer_category(prompt)
-
-    evaluator_ids = list(_DEFAULT_EVALUATORS)
-    if _custom_evaluator_id:
-        evaluator_ids.append(_custom_evaluator_id)
-
-    agent_id = os.getenv("AGENTCORE_AGENT_ID", "")
-    region = os.getenv("AGENTCORE_REGION", "us-east-1")
-
-    scores = []
-    from datetime import timedelta
-    from bedrock_agentcore.evaluation.client import EvaluationClient
-
-    max_attempts = 3
-    retry_delays = [0, 30, 60]
-    for attempt in range(max_attempts):
-        if attempt > 0:
-            print(f"[eval] retry {attempt}/{max_attempts-1} for {turn_id} after {retry_delays[attempt]}s")
-            await asyncio.sleep(retry_delays[attempt])
-        try:
-            eval_client = EvaluationClient(region_name=region)
-            print(f"[eval] attempt {attempt+1}/{max_attempts} for turn={turn_id}, session={session_id}, trace={trace_id}")
-            results = eval_client.run(
-                evaluator_ids=evaluator_ids,
-                session_id=session_id,
-                agent_id=agent_id if agent_id else None,
-                trace_id=trace_id.replace("-", "") if trace_id else None,
-                look_back_time=timedelta(minutes=15),
-            )
-            print(f"[eval] got {len(results)} results for {turn_id}")
-            for r in results:
-                is_custom = r.get("evaluatorId", "") not in _DEFAULT_EVALUATORS
-                score_val = r.get("value", 0.0)
-                if score_val is None:
-                    continue
-                scores.append({
-                    "evaluator": r.get("evaluatorId", ""),
-                    "score": score_val,
-                    "label": _score_label(score_val),
-                    "eval_source": "custom" if is_custom else "agentcore",
-                    "explanation": r.get("explanation", ""),
-                })
-            if scores:
-                break
-        except Exception as e:
-            err_msg = str(e)
-            print(f"[eval] attempt {attempt+1} failed for {turn_id}: {err_msg}")
-            if "no spans with supported scope" in err_msg and attempt < max_attempts - 1:
-                continue
-            break
-
-    if not scores:
-        print(f"[eval] no scores for {turn_id}")
-        return
-
-    builtin_scores = [s for s in scores if s.get("eval_source") != "custom"]
-    avg_score = round(sum(s["score"] for s in builtin_scores) / max(len(builtin_scores), 1), 3)
-
-    turn_eval = {
-        "turn_id": turn_id,
-        "trace_id": trace_id,
-        "scores": scores,
-        "avg_score": avg_score,
-        "prompt_version": prompt_version,
-        "timestamp": datetime.utcnow().isoformat(),
-        "eval_source": "agentcore",
-        "prompt": prompt,
-        "response": response[:1000],
-        "tools_used": tools_used or [],
-        "category": category,
-    }
-    _turn_evals[turn_id] = turn_eval
-    _turn_eval_order.append(turn_id)
-
-    # 개선 후 첫 평가면 after_score 기록
-    if _improvement_state["status"] == "applied" and _improvement_state["after_score"] is None:
-        _improvement_state["after_score"] = avg_score
-
-    emit(Events.EVAL_RUN, evaluators=_DEFAULT_EVALUATORS,
-         prompt_version=prompt_version, avg_score=avg_score)
-
-    # 점수 낮으면 개선 파이프라인 트리거
-    if avg_score < 0.65 and _improvement_state["status"] == "idle":
-        await _trigger_improvement(avg_score, prompt_version)
-
-
-async def _trigger_improvement(trigger_score: float, current_version: str):
-    """낮은 평가 점수에 대한 개선 제안 생성."""
-    suggestion = _IMPROVEMENT_SUGGESTIONS.get(current_version)
-    if not suggestion:
-        return
-
-    _improvement_state["status"] = "analyzing"
-    _improvement_state["trigger_score"] = trigger_score
-
-    await asyncio.sleep(2.0)
-
-    _improvement_state["status"] = "ready"
-    _improvement_state["suggestion"] = suggestion
-    _improvement_state["before_score"] = trigger_score
-    _improvement_state["after_score"] = None
 
 
 # --- Observability Endpoints ---
@@ -2251,7 +2681,7 @@ def get_anomalies():
 
         # 실제 알람 조회
         response = cw.describe_alarms(
-            AlarmNamePrefix="agentops-anomaly",
+            AlarmNamePrefix=_ALARM_PREFIX,
             AlarmTypes=["MetricAlarm"],
         )
         raw_alarms = response.get("MetricAlarms", [])

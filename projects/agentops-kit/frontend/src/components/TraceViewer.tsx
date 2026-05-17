@@ -1,12 +1,13 @@
 import { useState, useEffect, memo } from "react";
 import { Zap, ChevronRight, ChevronDown, Copy } from "lucide-react";
-import { Trace, Span } from "../types";
+import { Trace, Span, TraceSSEEvent } from "../types";
 import { api } from "../api";
 
 interface Props {
   traces: Trace[];
   selectedTrace: Trace | null;
   onSelectTrace: (trace: Trace | null) => void;
+  onHoursChange?: (hours: number) => void;
   compact?: boolean;
 }
 
@@ -148,14 +149,34 @@ function AttrGroup({ group }: { group: { label: string; color: string; defaultOp
       </div>
       {open && (
         <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "1px 10px", paddingLeft: 14, marginTop: 2 }}>
-          {group.entries.map(([k, v]) => (
-            <div key={k} style={{ display: "contents" }}>
-              <span style={{ color: "var(--gray-500)", fontFamily: "'JetBrains Mono', monospace", fontSize: 10 }}>{k}</span>
-              <span style={{ color: "var(--gray-300)", fontFamily: "'JetBrains Mono', monospace", fontSize: 10, wordBreak: "break-all" }}>
-                {typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(4)) : String(v)}
-              </span>
-            </div>
-          ))}
+          {group.entries.map(([k, v]) => {
+            const strVal = typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(4)) : String(v);
+            const isJson = typeof v === "string" && (v.startsWith("{") || v.startsWith("["));
+            let parsed: any = null;
+            if (isJson) { try { parsed = JSON.parse(v); } catch {} }
+            return (
+              <div key={k} style={{ display: "contents" }}>
+                <span style={{ color: "var(--gray-500)", fontFamily: "'JetBrains Mono', monospace", fontSize: 10, alignSelf: parsed ? "start" : "center" }}>{k}</span>
+                {parsed ? (
+                  <pre style={{
+                    margin: 0, padding: "3px 6px", borderRadius: 3, fontSize: 10,
+                    whiteSpace: "pre-wrap", wordBreak: "break-all", lineHeight: 1.4,
+                    background: "rgba(255,255,255,0.03)",
+                    border: "1px solid var(--gray-700, #374151)",
+                    color: "var(--gray-300, #d1d5db)",
+                    fontFamily: "'JetBrains Mono', monospace",
+                    maxHeight: 200, overflowY: "auto",
+                  }}>
+                    {JSON.stringify(parsed, null, 2)}
+                  </pre>
+                ) : (
+                  <span style={{ color: "var(--gray-300)", fontFamily: "'JetBrains Mono', monospace", fontSize: 10, wordBreak: "break-all" }}>
+                    {strVal}
+                  </span>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -163,11 +184,11 @@ function AttrGroup({ group }: { group: { label: string; color: string; defaultOp
 }
 
 const LLM_EVENT_STYLES: Record<string, { label: string; color: string; icon: string }> = {
-  "gen_ai.input.message": { label: "Input", color: "#0073bb", icon: "\u25B6" },
-  "gen_ai.choice": { label: "Output", color: "#8b5cf6", icon: "\u25C0" },
-  "gen_ai.tool_call": { label: "Tool Use", color: "#06b6d4", icon: "\u2699" },
-  "gen_ai.tool.message": { label: "Tool Result", color: "#f59e0b", icon: "\u2692" },
-  "gen_ai.message": { label: "Message", color: "#6b7280", icon: "\u25CF" },
+  "gen_ai.input.message": { label: "Input", color: "#0073bb", icon: "▶" },
+  "gen_ai.choice": { label: "Output", color: "#8b5cf6", icon: "◀" },
+  "gen_ai.tool_call": { label: "Tool Use", color: "#06b6d4", icon: "⚙" },
+  "gen_ai.tool.message": { label: "Tool Result", color: "#f59e0b", icon: "⚒" },
+  "gen_ai.message": { label: "Message", color: "#6b7280", icon: "●" },
 };
 
 function LLMEventSection({ events }: { events: NonNullable<Span["events"]> }) {
@@ -181,6 +202,9 @@ function LLMEventSection({ events }: { events: NonNullable<Span["events"]> }) {
           {llmEvents.map((ev, i) => {
             const style = LLM_EVENT_STYLES[ev.name];
             const content = ev.body || ev.attributes?.["gen_ai.content"] || "";
+            const hasRoles = /^\[(system|user|assistant|tool)\]\s/m.test(content);
+            const isToolCall = ev.name === "gen_ai.tool_call";
+            const isToolResult = ev.name === "gen_ai.tool.message";
             return (
               <div key={i}>
                 <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
@@ -188,7 +212,12 @@ function LLMEventSection({ events }: { events: NonNullable<Span["events"]> }) {
                   <span style={{ color: style.color, fontWeight: 700, fontSize: 10 }}>{style.label}</span>
                   <span style={{ color: "var(--gray-600)", fontSize: 9 }}>{ev.timestamp_ms.toFixed(0)}ms</span>
                 </div>
-                {content && <StepContentBlock text={content} maxHeight={160} />}
+                {content && ((isToolCall || isToolResult)
+                  ? <JsonContentBlock text={content} maxHeight={160} />
+                  : hasRoles
+                  ? <RoleMessageBlock text={content} maxHeight={200} />
+                  : <StepContentBlock text={content} maxHeight={160} />
+                )}
               </div>
             );
           })}
@@ -321,6 +350,127 @@ function StepContentBlock({ text, maxHeight }: { text: string; maxHeight: number
   );
 }
 
+const ROLE_STYLES: Record<string, { label: string; color: string; bg: string }> = {
+  system: { label: "System", color: "#6b7280", bg: "rgba(107,114,128,0.08)" },
+  user: { label: "User", color: "#3b82f6", bg: "rgba(59,130,246,0.08)" },
+  assistant: { label: "Assistant", color: "#8b5cf6", bg: "rgba(139,92,246,0.08)" },
+  tool: { label: "Tool", color: "#f59e0b", bg: "rgba(245,158,11,0.08)" },
+};
+
+function parseRoleMessages(text: string): { role: string; content: string }[] | null {
+  const regex = /^\[(system|user|assistant|tool)\]\s/m;
+  if (!regex.test(text)) return null;
+  const parts: { role: string; content: string }[] = [];
+  const lines = text.split("\n");
+  let currentRole = "";
+  let currentContent: string[] = [];
+  for (const line of lines) {
+    const match = line.match(/^\[(system|user|assistant|tool)\]\s?(.*)/);
+    if (match) {
+      if (currentRole) {
+        parts.push({ role: currentRole, content: currentContent.join("\n") });
+      }
+      currentRole = match[1];
+      currentContent = match[2] ? [match[2]] : [];
+    } else {
+      currentContent.push(line);
+    }
+  }
+  if (currentRole) {
+    parts.push({ role: currentRole, content: currentContent.join("\n") });
+  }
+  return parts.length > 0 ? parts : null;
+}
+
+function RoleMessageBlock({ text, maxHeight }: { text: string; maxHeight: number }) {
+  const [expanded, setExpanded] = useState(false);
+  const messages = parseRoleMessages(text);
+  if (!messages) return <StepContentBlock text={text} maxHeight={maxHeight} />;
+
+  const totalLen = messages.reduce((acc, m) => acc + m.content.length, 0);
+  const isLong = totalLen > 400;
+
+  return (
+    <div>
+      <div style={{ maxHeight: expanded ? "none" : maxHeight, overflowY: expanded ? "auto" : "hidden", position: "relative" }}>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          {messages.map((msg, i) => {
+            const rs = ROLE_STYLES[msg.role] || ROLE_STYLES.user;
+            let displayContent = msg.content;
+            if (msg.role === "tool" || msg.role === "assistant") {
+              try {
+                const parsed = JSON.parse(msg.content);
+                displayContent = JSON.stringify(parsed, null, 2);
+              } catch { /* keep as-is */ }
+            }
+            return (
+              <div key={i} style={{ background: rs.bg, borderRadius: 4, padding: "4px 8px", borderLeft: `2px solid ${rs.color}` }}>
+                <div style={{ fontSize: 9, fontWeight: 700, color: rs.color, marginBottom: 2 }}>{rs.label}</div>
+                <div style={{
+                  fontSize: 10, color: "var(--gray-200)", whiteSpace: "pre-wrap", wordBreak: "break-word",
+                  fontFamily: "'JetBrains Mono', monospace", lineHeight: 1.5,
+                  maxHeight: msg.role === "system" ? 40 : undefined, overflow: msg.role === "system" ? "hidden" : undefined,
+                }}>
+                  {displayContent.slice(0, 1500)}{displayContent.length > 1500 ? "..." : ""}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {!expanded && isLong && (
+          <div style={{ position: "absolute", bottom: 0, left: 0, right: 0, height: 32, background: "linear-gradient(transparent, var(--bg-secondary, #1e293b))" }} />
+        )}
+      </div>
+      {isLong && (
+        <button
+          onClick={() => setExpanded(!expanded)}
+          style={{ background: "none", border: "none", color: "var(--amber-light)", fontSize: 10, cursor: "pointer", padding: "2px 0", marginTop: 2 }}
+        >
+          {expanded ? "접기" : "더 보기"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+function JsonContentBlock({ text, maxHeight }: { text: string; maxHeight: number }) {
+  const [expanded, setExpanded] = useState(false);
+  let display = text;
+  try {
+    const parsed = JSON.parse(text);
+    display = JSON.stringify(parsed, null, 2);
+  } catch {
+    const jsonStart = text.search(/\{["\w]/);
+    if (jsonStart > 0) {
+      const prefix = text.slice(0, jsonStart).trim();
+      const jsonPart = text.slice(jsonStart);
+      try {
+        const parsed = JSON.parse(jsonPart);
+        display = (prefix ? prefix + "\n" : "") + JSON.stringify(parsed, null, 2);
+      } catch { /* keep as-is */ }
+    }
+  }
+  const isLong = display.length > 400;
+  return (
+    <div>
+      <pre style={{
+        margin: 0, padding: "6px 8px", borderRadius: 4, fontSize: 10,
+        whiteSpace: "pre-wrap", wordBreak: "break-word", lineHeight: 1.5,
+        background: "rgba(255,255,255,0.03)", border: "1px solid var(--gray-700, #374151)",
+        color: "var(--gray-300)", fontFamily: "'JetBrains Mono', monospace",
+        maxHeight: expanded ? "none" : maxHeight, overflow: expanded ? "auto" : "hidden",
+      }}>
+        {display.slice(0, 3000)}
+      </pre>
+      {isLong && (
+        <button onClick={() => setExpanded(!expanded)} style={{ background: "none", border: "none", color: "var(--amber-light)", fontSize: 10, cursor: "pointer", padding: "2px 0", marginTop: 2 }}>
+          {expanded ? "접기" : "더 보기"}
+        </button>
+      )}
+    </div>
+  );
+}
+
 function formatTime(ts: string): string {
   try {
     const d = new Date(ts);
@@ -383,140 +533,6 @@ function buildTimelineRows(trace: Trace): TimelineRow[] {
   return rows;
 }
 
-function UnifiedMetadataBar({ trace }: { trace: Trace }) {
-  const source = trace.span_source || "local";
-  const ss = SOURCE_STYLES[source] || SOURCE_STYLES.local;
-  const model = trace.model || trace.attributes?.["gen_ai.request.model"] || "";
-  const shortModel = model.replace(/^global\.anthropic\./, "").replace(/^us\.amazon\./, "");
-  const latency = trace.latency_ms ?? trace.duration_ms ?? 0;
-  const tokenIn = trace.token_usage?.input_tokens || 0;
-  const tokenOut = trace.token_usage?.output_tokens || 0;
-  const allFlat = flattenSpans(trace.spans || []);
-  const [copiedId, setCopiedId] = useState<string | null>(null);
-
-  const copyId = (label: string, value: string) => {
-    navigator.clipboard.writeText(value);
-    setCopiedId(label);
-    setTimeout(() => setCopiedId(null), 1500);
-  };
-
-  return (
-    <div
-      style={{
-        display: "flex",
-        gap: 10,
-        flexWrap: "wrap",
-        alignItems: "center",
-        marginBottom: 10,
-        padding: "8px 12px",
-        background: "var(--bg-tertiary, #0f172a)",
-        borderRadius: 8,
-        border: "1px solid var(--gray-700, #374151)",
-        fontSize: 11,
-      }}
-    >
-      <span
-        style={{
-          display: "inline-flex",
-          alignItems: "center",
-          gap: 4,
-          padding: "2px 8px",
-          borderRadius: 4,
-          background: ss.bg,
-          color: ss.color,
-          fontWeight: 700,
-          fontSize: 10,
-          letterSpacing: "0.03em",
-        }}
-      >
-        <span style={{ width: 6, height: 6, borderRadius: "50%", background: ss.color }} />
-        {ss.label}
-      </span>
-
-      {shortModel && (
-        <span style={{ color: "var(--gray-300)", fontWeight: 600 }}>{shortModel}</span>
-      )}
-
-      {trace.prompt_version && (
-        <span
-          style={{
-            padding: "1px 6px",
-            borderRadius: 3,
-            background: "rgba(245,158,11,0.12)",
-            color: "var(--amber)",
-            fontWeight: 700,
-            fontSize: 10,
-          }}
-        >
-          {trace.prompt_version.toUpperCase()}
-        </span>
-      )}
-
-      <span
-        style={{
-          fontSize: 14,
-          fontWeight: 700,
-          color: "var(--amber-light)",
-          fontFamily: "'JetBrains Mono', monospace",
-        }}
-      >
-        {latency.toFixed(0)}ms
-      </span>
-
-      {(tokenIn > 0 || tokenOut > 0) && (
-        <span style={{ fontSize: 11, color: "var(--gray-400)", fontFamily: "'JetBrains Mono', monospace" }}>
-          <span style={{ color: "#3b82f6" }}>{tokenIn}</span>
-          <span style={{ color: "var(--gray-500)" }}> 입력 / </span>
-          <span style={{ color: "#8b5cf6" }}>{tokenOut}</span>
-          <span style={{ color: "var(--gray-500)" }}> 출력</span>
-        </span>
-      )}
-
-      <span style={{ color: "var(--gray-500)", fontSize: 10 }}>
-        스팬 {allFlat.length}개
-      </span>
-
-      {trace.tools_used && trace.tools_used.length > 0 && (
-        <div style={{ display: "flex", gap: 3 }}>
-          {trace.tools_used.map((t) => (
-            <span key={t} className="tool-badge">{t}</span>
-          ))}
-        </div>
-      )}
-
-      {trace.status === "error" && (
-        <span style={{ padding: "1px 6px", borderRadius: 3, background: "rgba(239,68,68,0.15)", color: "#ef4444", fontSize: 10, fontWeight: 700 }}>
-          ERROR
-        </span>
-      )}
-
-      <span
-        style={{ color: "var(--gray-500)", fontSize: 10, cursor: "pointer" }}
-        title={trace.trace_id}
-        onClick={() => copyId("trace", trace.trace_id)}
-      >
-        트레이스:{" "}
-        <span style={{ color: copiedId === "trace" ? "#22c55e" : "var(--gray-400)", fontFamily: "'JetBrains Mono', monospace", transition: "color 0.2s" }}>
-          {trace.trace_id.slice(0, 12)}...
-        </span>
-        <Copy size={9} style={{ marginLeft: 3, verticalAlign: "middle", color: copiedId === "trace" ? "#22c55e" : "var(--gray-600)" }} />
-      </span>
-
-      {trace.session_id && (
-        <span
-          style={{ color: "var(--gray-500)", fontSize: 10, cursor: "pointer" }}
-          title={trace.session_id}
-          onClick={() => copyId("session", trace.session_id!)}
-        >
-          세션:{" "}
-          <span style={{ color: copiedId === "session" ? "#22c55e" : "var(--gray-400)", fontFamily: "'JetBrains Mono', monospace" }}>
-            {trace.session_id.slice(0, 8)}...
-          </span>
-        </span>
-      )}
-    </div>
-  );
-}
 
 function AgentStepSummaryStrip({ trace }: { trace: Trace }) {
   const steps = inferAgentSteps(trace.spans || []);
@@ -774,9 +790,9 @@ function UnifiedSpanRow({
 }
 
 const PSEUDO_ICONS: Record<string, string> = {
-  system_prompt: "\u2699",
-  user_input: "\uD83D\uDC64",
-  assistant_response: "\uD83E\uDD16",
+  system_prompt: "⚙",
+  user_input: "👤",
+  assistant_response: "🤖",
 };
 
 function PseudoSpanRow({
@@ -788,7 +804,7 @@ function PseudoSpanRow({
   expanded: boolean;
   onToggle: () => void;
 }) {
-  const icon = PSEUDO_ICONS[row.id] || "\u25CF";
+  const icon = PSEUDO_ICONS[row.id] || "●";
 
   return (
     <>
@@ -863,68 +879,352 @@ function PseudoSpanRow({
   );
 }
 
-function UnifiedSpanTimeline({ trace }: { trace: Trace }) {
-  const [expandedSpans, setExpandedSpans] = useState<Set<string>>(new Set());
+function SpanAttributeRow({ name, value }: { name: string; value: any }) {
+  const strVal = typeof value === "string" ? value : JSON.stringify(value);
+  const isJson = strVal.startsWith("{") || strVal.startsWith("[");
+  const isError = strVal.includes("error") || strVal.includes("Error") || strVal.includes("500");
 
-  const allRows = buildTimelineRows(trace);
-  const allFlat = flattenSpans(trace.spans || []);
-
-  const realSpans = allFlat.map((f) => f.span);
-  const traceStart = realSpans.length > 0 ? Math.min(...realSpans.map((s) => s.start_ms)) : 0;
-  const traceEnd = realSpans.length > 0 ? Math.max(...realSpans.map((s) => s.start_ms + s.duration_ms)) : 0;
-  const totalDuration = traceEnd - traceStart || 1;
-
-  const toggleSpan = (id: string) => {
-    setExpandedSpans((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  };
-
-  if (allRows.length === 0) {
-    return (
-      <div style={{ fontSize: 11, color: "var(--gray-500)", padding: 8 }}>
-        No trace data available
-      </div>
-    );
+  let parsed: any = null;
+  if (isJson) {
+    try { parsed = JSON.parse(strVal); } catch {}
   }
 
   return (
-    <div>
-      {realSpans.length > 0 && <UnifiedTimelineHeader totalDuration={totalDuration} />}
-
-      {allRows.map((row) =>
-        row.type === "pseudo" ? (
-          <PseudoSpanRow
-            key={row.id}
-            row={row}
-            expanded={expandedSpans.has(row.id)}
-            onToggle={() => toggleSpan(row.id)}
-          />
-        ) : row.span ? (
-          <UnifiedSpanRow
-            key={row.id}
-            span={row.span}
-            depth={row.depth || 0}
-            traceStart={traceStart}
-            totalDuration={totalDuration}
-            expanded={expandedSpans.has(row.span.span_id)}
-            onToggle={() => toggleSpan(row.span!.span_id)}
-            hasChildren={!!row.span.subsegments?.length}
-          />
-        ) : null
+    <div style={{ marginBottom: 4 }}>
+      <div style={{ color: "var(--gray-600, #6b7280)", fontSize: 10, marginBottom: 2 }}>{name}</div>
+      {parsed ? (
+        <pre style={{
+          margin: 0, padding: "4px 8px", borderRadius: 3, fontSize: 10,
+          whiteSpace: "pre-wrap", wordBreak: "break-all", lineHeight: 1.5,
+          background: isError ? "rgba(239,68,68,0.08)" : "rgba(255,255,255,0.03)",
+          border: `1px solid ${isError ? "rgba(239,68,68,0.2)" : "var(--gray-700, #374151)"}`,
+          color: isError ? "#fca5a5" : "var(--gray-400, #9ca3af)",
+        }}>
+          {JSON.stringify(parsed, null, 2)}
+        </pre>
+      ) : (
+        <span style={{
+          wordBreak: "break-all",
+          color: isError ? "#fca5a5" : "var(--gray-400, #9ca3af)",
+        }}>
+          {strVal}
+        </span>
       )}
     </div>
   );
 }
 
+function GanttTimeline({ trace }: { trace: Trace }) {
+  const [expandedSpan, setExpandedSpan] = useState<string | null>(null);
+  const [labelWidth, setLabelWidth] = useState(180);
+  const dragRef = { startX: 0, startWidth: 0 };
+
+  const onResizeStart = (e: React.MouseEvent) => {
+    e.preventDefault();
+    dragRef.startX = e.clientX;
+    dragRef.startWidth = labelWidth;
+    const onMove = (ev: MouseEvent) => {
+      const newWidth = Math.max(80, Math.min(400, dragRef.startWidth + ev.clientX - dragRef.startX));
+      setLabelWidth(newWidth);
+    };
+    const onUp = () => {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    };
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  };
+
+  const allSpans = trace.spans ? flattenSpans(trace.spans) : [];
+  const totalDuration = trace.duration_ms || trace.latency_ms || 1;
+
+  const axisTicks = 5;
+  const tickInterval = totalDuration / axisTicks;
+  const timeLabels = Array.from({ length: axisTicks + 1 }, (_, i) => {
+    const ms = i * tickInterval;
+    return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${Math.round(ms)}ms`;
+  });
+
+  return (
+    <div>
+      <style>{`
+  @keyframes shimmer {
+    0% { transform: translateX(-100%); }
+    100% { transform: translateX(400%); }
+  }
+`}</style>
+      {/* Time axis (right side only) */}
+      <div style={{ display: "flex", marginBottom: 4 }}>
+        <div style={{ width: labelWidth, flexShrink: 0, position: "relative" }}>
+          <div
+            onMouseDown={onResizeStart}
+            style={{
+              position: "absolute", right: 0, top: 0, bottom: 0, width: 4,
+              cursor: "col-resize", background: "transparent",
+            }}
+            onMouseEnter={(e) => (e.currentTarget.style.background = "var(--gray-600, #6b7280)")}
+            onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+          />
+        </div>
+        <div style={{
+          flex: 1, height: 20,
+          borderBottom: "1px solid var(--gray-700, #374151)",
+          display: "flex", justifyContent: "space-between",
+          fontSize: 9, color: "var(--gray-600, #6b7280)", padding: "0 4px",
+        }}>
+          {timeLabels.map((label, i) => <span key={i}>{label}</span>)}
+        </div>
+      </div>
+
+      {/* Spans */}
+      <div>
+        {allSpans.map(({ span, depth }, idx) => {
+          const leftPct = (span.start_ms / totalDuration) * 100;
+          const widthPct = Math.max((span.duration_ms / totalDuration) * 100, 0.5);
+          const color = SPAN_COLORS[span.type] || SPAN_COLORS.other;
+          const isExpanded = expandedSpan === span.span_id;
+          const isRunning = span.status === "running";
+          const displayName = span.name.replace(/^(strands\.telemetry\.|botocore\.)/, "");
+          const isRoot = depth === 0;
+          const isNewGroup = idx === 0 || allSpans[idx - 1].depth < depth || (depth === 1 && allSpans[idx - 1].depth <= depth && span.parent_span_id !== allSpans[idx - 1].span.parent_span_id);
+
+          return (
+            <div key={span.span_id}>
+              <div
+                onClick={() => setExpandedSpan(isExpanded ? null : span.span_id)}
+                style={{
+                  display: "flex", alignItems: "center", height: 32, cursor: "pointer",
+                  borderBottom: "1px solid var(--gray-800, #1f2937)",
+                  marginTop: isRoot || isNewGroup ? 8 : 0,
+                  borderTop: isRoot ? "1px solid var(--gray-700, #374151)" : undefined,
+                }}
+              >
+                {/* Span name (left) */}
+                <div
+                  title={displayName}
+                  style={{
+                    width: labelWidth, flexShrink: 0, position: "relative",
+                    fontSize: 11, color,
+                    display: "flex", alignItems: "center", height: 32,
+                    paddingLeft: depth * 14 + 4,
+                  }}
+                >
+                  {/* Tree connector lines (absolute, no layout impact) */}
+                  {depth > 0 && (
+                    <span style={{ position: "absolute", left: 0, top: 0, bottom: 0, display: "flex", alignItems: "stretch" }}>
+                      {Array.from({ length: depth - 1 }, (_, i) => (
+                        <span key={i} style={{ width: 14, borderLeft: "1px solid var(--gray-700, #374151)" }} />
+                      ))}
+                      <span style={{ width: 14, borderLeft: "1px solid var(--gray-700, #374151)", borderBottom: "1px solid var(--gray-700, #374151)", borderBottomLeftRadius: 3, height: "50%" }} />
+                    </span>
+                  )}
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {displayName}
+                  </span>
+                  <span style={{ color: "var(--gray-600, #6b7280)", marginLeft: 4, fontSize: 9, flexShrink: 0 }}>
+                    {span.duration_ms >= 1000 ? `${(span.duration_ms / 1000).toFixed(1)}s` : `${Math.round(span.duration_ms)}ms`}
+                  </span>
+                </div>
+
+                {/* Gantt bar (right) */}
+                <div style={{ flex: 1, position: "relative", height: 14 }}>
+                  <div style={{
+                    position: "absolute",
+                    left: `${leftPct}%`,
+                    width: `${widthPct}%`,
+                    height: 14,
+                    background: isRunning ? `linear-gradient(90deg, ${color}33, ${color}11)` : `${color}22`,
+                    border: `1px solid ${isRunning ? color : `${color}66`}`,
+                    borderRadius: 3,
+                    minWidth: 4,
+                    overflow: isRunning ? "hidden" : undefined,
+                  }}>
+                    {isRunning && (
+                      <div style={{
+                        position: "absolute", top: 0, left: 0, bottom: 0, width: "30%",
+                        background: `linear-gradient(90deg, transparent, ${color}44, transparent)`,
+                        animation: "shimmer 1.5s infinite",
+                      }} />
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Expanded detail panel */}
+              {isExpanded && (
+                <div style={{
+                  marginLeft: labelWidth, marginBottom: 8, padding: "8px 12px",
+                  background: "var(--bg-secondary, #1e293b)", borderRadius: 4,
+                  border: "1px solid var(--gray-700, #374151)", fontSize: 11,
+                }}>
+                  {span.attributes && Object.keys(span.attributes).length > 0 && (
+                    <div style={{ marginBottom: 6 }}>
+                      <div style={{ color: "var(--gray-500)", marginBottom: 4 }}>Attributes:</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "auto 1fr", gap: "2px 12px", alignItems: "baseline" }}>
+                        {Object.entries(span.attributes).map(([k, v]) => {
+                          const strVal = typeof v === "number" ? (Number.isInteger(v) ? v.toLocaleString() : v.toFixed(4)) : String(v);
+                          const isJson = typeof v === "string" && (strVal.startsWith("{") || strVal.startsWith("["));
+                          let parsed: any = null;
+                          if (isJson) { try { parsed = JSON.parse(strVal); } catch {} }
+                          const isError = strVal.includes("error") || strVal.includes("Error") || strVal.includes("500");
+                          return (
+                            <div key={k} style={{ display: "contents" }}>
+                              <span style={{ color: "var(--gray-500)", fontFamily: "'JetBrains Mono', monospace", fontSize: 10, whiteSpace: "nowrap" }}>{k}</span>
+                              {parsed ? (
+                                <pre style={{
+                                  margin: 0, padding: "3px 6px", borderRadius: 3, fontSize: 10,
+                                  whiteSpace: "pre-wrap", wordBreak: "break-all", lineHeight: 1.4,
+                                  background: isError ? "rgba(239,68,68,0.08)" : "rgba(255,255,255,0.03)",
+                                  border: `1px solid ${isError ? "rgba(239,68,68,0.2)" : "var(--gray-700, #374151)"}`,
+                                  color: isError ? "#fca5a5" : "var(--gray-300, #d1d5db)",
+                                  fontFamily: "'JetBrains Mono', monospace",
+                                  maxHeight: 200, overflowY: "auto",
+                                }}>
+                                  {JSON.stringify(parsed, null, 2)}
+                                </pre>
+                              ) : (
+                                <span style={{
+                                  color: isError ? "#fca5a5" : "var(--gray-300, #d1d5db)",
+                                  fontFamily: "'JetBrains Mono', monospace", fontSize: 10, wordBreak: "break-all",
+                                }}>
+                                  {strVal}
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                  {span.events && span.events.length > 0 && (
+                    <div>
+                      <div style={{ color: "var(--gray-500)", marginBottom: 4 }}>Events:</div>
+                      {span.events.map((ev, i) => {
+                        const content = ev.body || "";
+                        const evStyle = LLM_EVENT_STYLES[ev.name];
+                        const hasRoles = /^\[(system|user|assistant|tool)\]\s/m.test(content);
+                        const isToolCall = ev.name === "gen_ai.tool_call";
+                        const isToolResult = ev.name === "gen_ai.tool.message";
+                        return (
+                          <div key={i} style={{ marginBottom: 6 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 3 }}>
+                              {evStyle && <span style={{ color: evStyle.color, fontSize: 10 }}>{evStyle.icon}</span>}
+                              <span style={{ color: evStyle?.color || "var(--gray-500)", fontWeight: 600, fontSize: 10 }}>{evStyle?.label || ev.name}</span>
+                              <span style={{ color: "var(--gray-600)", fontSize: 9 }}>{ev.timestamp_ms?.toFixed(0)}ms</span>
+                            </div>
+                            {content && ((isToolCall || isToolResult)
+                              ? <JsonContentBlock text={content} maxHeight={160} />
+                              : hasRoles
+                              ? <RoleMessageBlock text={content} maxHeight={200} />
+                              : <StepContentBlock text={content} maxHeight={160} />
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Legend */}
+      <div style={{
+        display: "flex", gap: 16, marginTop: 16, paddingTop: 12,
+        borderTop: "1px solid var(--gray-700, #374151)", fontSize: 10,
+      }}>
+        {Object.entries(SPAN_COLORS).filter(([k]) => k !== "cost" && k !== "other").map(([type, color]) => (
+          <div key={type} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ width: 10, height: 10, background: color, borderRadius: 2 }} />
+            <span style={{ color: "var(--gray-500)" }}>{SPAN_LABELS[type]}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
 // --- Main Component ---
 
-function TraceViewerImpl({ traces, selectedTrace, onSelectTrace, compact }: Props) {
-  const displayTraces = compact ? traces.slice(0, 8) : traces;
+function TraceViewerImpl({ traces, selectedTrace, onSelectTrace, onHoursChange, compact }: Props) {
+  const [selectedHours, setSelectedHours] = useState(6);
+  const TIME_PRESETS = [
+    { label: "1h", value: 1 },
+    { label: "6h", value: 6 },
+    { label: "24h", value: 24 },
+    { label: "7d", value: 168 },
+  ];
+  const [liveTraces, setLiveTraces] = useState<Map<string, Trace>>(new Map());
+  const liveTraceList = Array.from(liveTraces.values());
+  const displayTraces = compact
+    ? [...liveTraceList, ...traces].slice(0, 8)
+    : [...liveTraceList, ...traces];
   const [detailedTrace, setDetailedTrace] = useState<Trace | null>(null);
+
+  useEffect(() => {
+    const disconnect = api.connectTraceStream((event: TraceSSEEvent) => {
+      setLiveTraces((prev) => {
+        const next = new Map(prev);
+
+        switch (event.type) {
+          case "trace_start":
+            next.set(event.data.trace_id, {
+              trace_id: event.data.trace_id,
+              prompt: event.data.prompt,
+              model: event.data.model,
+              timestamp: event.data.timestamp || new Date().toISOString(),
+              status: "live",
+              spans: [],
+              tools_used: [],
+              span_source: "otel",
+            });
+            break;
+
+          case "span_start": {
+            const t = next.get(event.data.trace_id);
+            if (t && t.spans) {
+              t.spans = [...t.spans, {
+                span_id: event.data.span_id || "",
+                name: event.data.name || "",
+                type: event.data.span_type || "other",
+                start_ms: event.data.start_ms || 0,
+                duration_ms: 0,
+                status: "running",
+              }];
+              if (event.data.span_type === "tool" && event.data.name) {
+                t.tools_used = [...(t.tools_used || []), event.data.name];
+              }
+            }
+            break;
+          }
+
+          case "span_end": {
+            const t = next.get(event.data.trace_id);
+            if (t && t.spans) {
+              t.spans = t.spans.map((s) =>
+                s.span_id === event.data.span_id
+                  ? { ...s, duration_ms: event.data.duration_ms || 0, status: event.data.status || "ok" }
+                  : s
+              );
+            }
+            break;
+          }
+
+          case "trace_end": {
+            next.delete(event.data.trace_id);
+            break;
+          }
+        }
+
+        return next;
+      });
+    });
+
+    return () => disconnect();
+  }, []);
 
   useEffect(() => {
     if (!selectedTrace) {
@@ -981,13 +1281,23 @@ function TraceViewerImpl({ traces, selectedTrace, onSelectTrace, compact }: Prop
               ← 목록으로
             </button>
 
-            {/* Unified Metadata Bar */}
-            <UnifiedMetadataBar trace={traceToShow} />
+            {/* Clean Summary Bar */}
+            <div style={{
+              display: "flex", gap: 20, padding: "10px 12px",
+              background: "var(--bg-secondary, #1e293b)", borderRadius: 6, marginBottom: 12,
+              fontSize: 11, alignItems: "center", flexWrap: "wrap",
+            }}>
+              <div><span style={{ color: "var(--gray-600, #6b7280)" }}>Duration</span>{" "}<span style={{ color: "var(--gray-100, #f1f5f9)" }}>{(traceToShow.duration_ms || 0) >= 1000 ? `${((traceToShow.duration_ms || 0) / 1000).toFixed(1)}s` : `${traceToShow.duration_ms || 0}ms`}</span></div>
+              <div><span style={{ color: "var(--gray-600, #6b7280)" }}>Model</span>{" "}<span style={{ color: "#a5b4fc" }}>{(traceToShow.model || "").replace(/^global\.anthropic\./, "").replace(/^us\.amazon\./, "")}</span></div>
+              <div><span style={{ color: "var(--gray-600, #6b7280)" }}>Tokens</span>{" "}<span style={{ color: "var(--gray-100, #f1f5f9)" }}>{traceToShow.token_usage?.input_tokens || 0} in / {traceToShow.token_usage?.output_tokens || 0} out</span></div>
+              <div><span style={{ color: "var(--gray-600, #6b7280)" }}>Tools</span>{" "}<span style={{ color: "#fbbf24" }}>{traceToShow.tools_used?.length || 0}</span></div>
+              {traceToShow.prompt_version && <div><span style={{ color: "var(--gray-600, #6b7280)" }}>Version</span>{" "}<span style={{ color: "var(--gray-500)" }}>{traceToShow.prompt_version}</span></div>}
+            </div>
 
             {/* Agent Step Summary Strip */}
             <AgentStepSummaryStrip trace={traceToShow} />
 
-            {/* Unified Span Timeline */}
+            {/* Gantt Timeline */}
             <div
               style={{
                 background: "var(--bg-tertiary, #0f172a)",
@@ -997,59 +1307,119 @@ function TraceViewerImpl({ traces, selectedTrace, onSelectTrace, compact }: Prop
                 overflow: "auto",
               }}
             >
-              <UnifiedSpanTimeline trace={traceToShow} />
+              <GanttTimeline trace={traceToShow} />
             </div>
           </div>
         ) : (
           <div className="trace-list">
+            {/* Time range filter */}
+            <div style={{ display: "flex", gap: 6, marginBottom: 12, alignItems: "center" }}>
+              <span style={{ fontSize: 11, color: "var(--gray-500)" }}>Time:</span>
+              {TIME_PRESETS.map((p) => (
+                <button
+                  key={p.value}
+                  onClick={() => {
+                    setSelectedHours(p.value);
+                    onHoursChange?.(p.value);
+                  }}
+                  style={{
+                    padding: "3px 10px",
+                    borderRadius: 4,
+                    border: `1px solid ${selectedHours === p.value ? "#6366f1" : "var(--gray-700, #374151)"}`,
+                    background: selectedHours === p.value ? "#312e81" : "var(--bg-secondary, #1e293b)",
+                    color: selectedHours === p.value ? "#a5b4fc" : "var(--gray-500)",
+                    fontSize: 11,
+                    cursor: "pointer",
+                  }}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Table header */}
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "1fr 160px 60px 60px",
+              gap: 8,
+              padding: "6px 8px",
+              fontSize: 10,
+              color: "var(--gray-600, #6b7280)",
+              borderBottom: "1px solid var(--gray-700, #374151)",
+            }}>
+              <span>Prompt</span>
+              <span>Tools</span>
+              <span>Tokens</span>
+              <span>Latency</span>
+            </div>
+
+            {/* Table rows */}
             {displayTraces.map((trace) => {
-              const model = (trace.model || "").replace(/^global\.anthropic\./, "").replace(/^us\.amazon\./, "");
-              const spanCount = trace.spans?.length;
+              const isLive = trace.status === "live";
+              const totalTokens = trace.token_usage
+                ? (trace.token_usage.total_tokens ?? ((trace.token_usage.input_tokens || 0) + (trace.token_usage.output_tokens || 0)))
+                : 0;
+              const latency = trace.latency_ms ?? trace.duration_ms ?? 0;
+
               return (
                 <div
                   key={trace.trace_id}
-                  className="trace-item"
                   onClick={() => onSelectTrace(trace)}
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "1fr 160px 60px 60px",
+                    gap: 8,
+                    padding: "8px",
+                    borderBottom: "1px solid var(--gray-800, #1e293b)",
+                    alignItems: "center",
+                    cursor: "pointer",
+                    background: isLive ? "#1e1b4b" : "transparent",
+                    borderRadius: 4,
+                    marginTop: 2,
+                  }}
                 >
-                  <span className={`trace-status ${trace.status === "error" || trace.error ? "error" : "ok"}`} />
-                  <span className="trace-id">
-                    {trace.trace_id.slice(0, 8)}
+                  {/* Prompt */}
+                  <span style={{
+                    fontSize: 12,
+                    color: "var(--gray-100, #f1f5f9)",
+                    whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                  }}>
+                    {trace.prompt || "—"}
                   </span>
-                  {trace.prompt_version && (
-                    <span style={{
-                      fontSize: 9, padding: "0px 4px", borderRadius: 3,
-                      background: "rgba(245,158,11,0.12)", color: "var(--amber)",
-                      fontWeight: 700, flexShrink: 0,
-                    }}>
-                      {trace.prompt_version.toUpperCase()}
-                    </span>
-                  )}
-                  <span style={{ fontSize: 11, color: "var(--gray-500)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {trace.prompt ? trace.prompt.slice(0, 30) + (trace.prompt.length > 30 ? "..." : "") : "\u2014"}
+
+                  {/* Tools */}
+                  <div style={{ display: "flex", gap: 3, flexWrap: "wrap", overflow: "hidden" }}>
+                    {(trace.tools_used || []).slice(0, 3).map((tool) => (
+                      <span key={tool} style={{
+                        padding: "1px 5px",
+                        borderRadius: 2,
+                        background: "rgba(245,158,11,0.08)",
+                        color: "#fbbf24",
+                        fontSize: 9,
+                        border: "1px solid rgba(245,158,11,0.25)",
+                        whiteSpace: "nowrap",
+                      }}>
+                        {tool.replace(/^(query_|check_|get_|analyze_)/, "")}
+                      </span>
+                    ))}
+                  </div>
+
+                  {/* Tokens */}
+                  <span style={{ fontSize: 11, color: "var(--gray-500)", fontFamily: "'JetBrains Mono', monospace" }}>
+                    {totalTokens > 1000 ? `${(totalTokens / 1000).toFixed(1)}k` : totalTokens || "—"}
                   </span>
-                  {model && (
-                    <span style={{ fontSize: 9, color: "var(--gray-500)", fontFamily: "'JetBrains Mono', monospace", flexShrink: 0 }}>
-                      {model}
-                    </span>
-                  )}
-                  {spanCount != null && spanCount > 0 && (
-                    <span style={{ fontSize: 9, color: "var(--gray-600)", flexShrink: 0 }}>
-                      {spanCount}sp
-                    </span>
-                  )}
-                  {trace.tools_used?.length ? (
-                    <span className="tool-badge">도구 {trace.tools_used.length}개</span>
-                  ) : null}
-                  {trace.token_usage && (
-                    <span style={{ fontSize: 9, fontFamily: "'JetBrains Mono', monospace", color: "var(--gray-500)" }}>
-                      {trace.token_usage.total_tokens ?? ((trace.token_usage.input_tokens || 0) + (trace.token_usage.output_tokens || 0))} 토큰
-                    </span>
-                  )}
-                  <span className="trace-latency">{trace.latency_ms ?? trace.duration_ms ?? 0}ms</span>
-                  <span style={{ fontSize: 10, color: "var(--gray-600)" }}>
-                    {formatTime(trace.timestamp)}
+
+                  {/* Latency */}
+                  <span style={{
+                    fontSize: 11,
+                    color: "var(--gray-500)",
+                    fontFamily: "'JetBrains Mono', monospace",
+                  }}>
+                    {latency > 1000 ? `${(latency / 1000).toFixed(1)}s` : `${Math.round(latency)}ms`}
                   </span>
-                  <ChevronRight size={12} style={{ color: "var(--gray-600)" }} />
+
                 </div>
               );
             })}

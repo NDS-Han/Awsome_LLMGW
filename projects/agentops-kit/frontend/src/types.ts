@@ -79,6 +79,27 @@ export interface Span {
   subsegments?: Span[];
 }
 
+export type TraceSSEEventType = "trace_start" | "span_start" | "span_end" | "trace_end";
+
+export interface TraceSSEEvent {
+  type: TraceSSEEventType;
+  data: {
+    trace_id: string;
+    prompt?: string;
+    model?: string;
+    timestamp?: string;
+    span_id?: string;
+    name?: string;
+    span_type?: "interaction" | "llm" | "tool" | "guardrail" | "cost" | "other";
+    start_ms?: number;
+    duration_ms?: number;
+    status?: string;
+    attributes?: Record<string, any>;
+    total_duration_ms?: number;
+    final_status?: string;
+  };
+}
+
 export interface MetricsData {
   invocation_count: number;
   latency: {
@@ -142,125 +163,130 @@ export interface TimeseriesPoint {
   value: number;
 }
 
-export interface EvalResult {
-  evaluator: string;
-  score: number;
+// --- AgentCore Evaluation API ---
+
+export interface Evaluator {
+  evaluator_id: string;
+  name: string;
+  description: string;
+  type: string;
+  level: string;
+  status: string;
+}
+
+export interface OnlineEvalConfig {
+  config_id: string;
+  config_name: string;
+  description: string;
+  status: string;
+  execution_status: string;
+  sampling_rate: number;
+  evaluators: string[];
+  output_log_group: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface EvalResultEntry {
+  evaluator_id: string;
+  score: number | null;
   label: string;
   explanation: string;
-  trace_count: number;
-  eval_source?: "agentcore" | "simulation";
-}
-
-export interface EvalEntry {
-  eval_id: string;
-  timestamp: string;
-  prompt_version: string;
-  evaluators: string[];
-  results: EvalResult[];
-  trace_count: number;
-}
-
-// --- Online Evaluation (per-turn) ---
-
-export interface TurnEvalScore {
-  evaluator: string;
-  score: number;
-  label: string;
-  eval_source?: "agentcore" | "custom" | "simulation";
-  explanation?: string;
-}
-
-export interface TurnEvalResult {
-  turn_id: string;
   trace_id: string;
-  scores: TurnEvalScore[];
-  avg_score: number;
-  prompt_version: string;
+  session_id: string;
   timestamp: string;
-  eval_source: "agentcore" | "simulation";
-  prompt?: string;
-  response?: string;
-  tools_used?: string[];
-  category?: string;
 }
 
-export interface ImprovementChange {
-  aspect: string;
-  before: string;
-  after: string;
-}
-
-export interface ImprovementState {
-  status: "idle" | "analyzing" | "ready" | "applied";
-  trigger_score?: number | null;
-  suggestion?: {
-    current_version: string;
-    suggested_version: string;
-    changes: ImprovementChange[];
-    expected_delta: string;
-    reason: string;
-  } | null;
-  before_score?: number | null;
-  after_score?: number | null;
-}
-
-// --- Evaluation Analysis ---
-
-export interface CategoryEvalData {
+export interface EvalResultsSummary {
   count: number;
   avg_score: number;
-  evaluator_scores: Record<string, number>;
+  by_evaluator: Record<string, { count: number; avg_score: number; min_score: number; max_score: number }>;
 }
 
-export interface EvaluatorBreakdown {
-  avg_score: number;
-  count: number;
-  trend: number[];
-  lowest?: { turn_id: string; score: number; prompt: string; response: string } | null;
+export interface OnlineEvalResults {
+  results: EvalResultEntry[];
+  summary: EvalResultsSummary;
+  error?: string;
 }
 
-export interface TimeTrendPoint {
-  turn_id: string;
+export interface BatchEvalSummary {
+  batch_id: string;
+  name: string;
+  status: string;
+  created_at: string;
+}
+
+export interface BatchEvalResult {
+  evaluator_id: string;
+  score: number | null;
+  label: string;
+  explanation: string;
+  trace_id: string;
+  session_id: string;
   timestamp: string;
-  avg_score: number;
-  prompt_version: string;
-  category: string;
 }
 
-export interface ToolCorrelation {
-  avg_score_when_used: number;
-  call_count: number;
+export interface BatchEvalDetail {
+  batch_id: string;
+  name: string;
+  status: string;
+  created_at: string;
+  sessions_completed: number;
+  sessions_in_progress: number;
+  sessions_failed: number;
+  total_sessions: number;
+  evaluator_summaries: { evaluator_id: string; average_score: number; total_evaluated: number; total_failed: number }[];
+  results?: BatchEvalResult[];
+  results_summary?: { count: number; avg_score: number; by_evaluator: Record<string, { count: number; avg_score: number; min_score: number; max_score: number }> };
 }
 
-export interface LowScoreAnalysis {
-  summary: string;
-  details: { evaluator: string; score: number; analysis: string }[];
-  recommendations: string[];
+// --- Optimization (AgentCore Optimization API) ---
+
+export interface Recommendation {
+  recommendation_id: string;
+  name: string;
+  status: "PENDING" | "IN_PROGRESS" | "COMPLETED" | "FAILED";
+  type: string;
+  evaluator_id?: string;
+  created_at: string;
+  updated_at?: string;
+  recommended_prompt?: string;
+  bundle_arn?: string;
+  bundle_version?: string;
+  error_code?: string;
+  error_message?: string;
 }
 
-export interface LowScoreTurn {
-  turn_id: string;
-  avg_score: number;
-  prompt: string;
-  response: string;
-  category: string;
-  tools_used: string[];
-  scores: TurnEvalScore[];
-  weakest_evaluator: string | null;
-  prompt_version: string;
+export interface ConfigBundle {
+  bundle_id: string;
+  bundle_arn?: string;
+  bundle_name: string;
+  version_id?: string;
+  description: string;
+  system_prompt?: string;
+  created_at: string;
+  version_created_at?: string;
+}
+
+export interface OptimizationStatus {
+  stage: "idle" | "recommending" | "recommended" | "applied" | "testing" | "deploying" | "complete";
+  active_recommendation?: Recommendation | null;
+  active_test?: { rule_id: string; status: string; control_weight: number; treatment_weight: number; created_at: string } | null;
+  history: OptimizationHistoryEntry[];
+}
+
+export interface OptimizationHistoryEntry {
+  type: "recommendation" | "bundle_version" | "error";
+  id?: string;
+  name?: string;
+  status?: string;
+  bundle_id?: string;
+  version_id?: string;
+  commit_message?: string;
+  message?: string;
   timestamp: string;
-  analysis: LowScoreAnalysis;
 }
 
-export interface EvalAnalysis {
-  by_category: Record<string, CategoryEvalData>;
-  by_evaluator: Record<string, EvaluatorBreakdown>;
-  time_trend: TimeTrendPoint[];
-  tool_correlation: Record<string, ToolCorrelation>;
-  low_score_turns: LowScoreTurn[];
-  summary: { improving: boolean; delta: number; total_turns: number };
-  custom_evaluator: { registered: boolean; evaluator_id: string | null };
-}
 
 // --- New: Guardrails ---
 
@@ -473,7 +499,9 @@ export interface RegistryRecord {
   name: string;
   description: string;
   descriptor_type: "MCP" | "A2A" | "CUSTOM" | "AGENT_SKILLS";
-  status: "DRAFT" | "SUBMITTED" | "APPROVED" | "REJECTED";
+  status: "DRAFT" | "SUBMITTED" | "APPROVED" | "REJECTED" | "DEPRECATED";
+  descriptor_url?: string;
+  search_score?: number;
   created_at: string | null;
   updated_at: string | null;
 }
@@ -487,7 +515,28 @@ export interface RegistryState {
   records: RegistryRecord[];
   by_type: Record<string, number>;
   by_status: Record<string, number>;
+  mcp_endpoint?: RegistryMcpEndpoint;
   error?: string;
+}
+
+export interface RegistrySearchResult {
+  records: RegistryRecord[];
+  query: string;
+  total: number;
+}
+
+export interface RegistryMcpEndpoint {
+  url: string;
+  auth_type: "IAM" | "JWT";
+  status: "connected" | "disconnected";
+  last_checked: string;
+}
+
+export interface PublishableResource {
+  name: string;
+  description: string;
+  type: "A2A" | "MCP";
+  descriptor_url?: string;
 }
 
 export interface AgentGatewayState {

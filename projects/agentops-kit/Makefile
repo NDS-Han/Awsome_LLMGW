@@ -1,4 +1,4 @@
-.PHONY: setup install data demo-start demo-stop demo-eval demo-improve demo-reset clean
+.PHONY: setup install data demo-start demo-stop demo-eval demo-optimize demo-recommend demo-ab-status demo-deploy cognito-deploy cognito-env cognito-outputs eval-role-setup clean
 
 # === Setup ===
 setup: install data
@@ -31,13 +31,13 @@ demo-start: demo-stop
 	OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf \
 	OTEL_RESOURCE_ATTRIBUTES=service.name=agentops-api \
 	OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT=true \
-	opentelemetry-instrument uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload &
+	python -m uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload &
 	@echo "Demo started. Traces → CloudWatch GenAI Observability."
 
 demo-start-prod: demo-stop
 	@echo "Starting production demo..."
 	cd frontend && npm run build && npm run preview -- --port 3000 &
-	uvicorn api.server:app --host 0.0.0.0 --port 8000 &
+	python -m uvicorn api.server:app --host 0.0.0.0 --port 8000 &
 	@echo "Production demo started."
 
 demo-stop:
@@ -53,22 +53,34 @@ demo-eval:
 demo-eval-full:
 	python evaluation/run_eval.py
 
-demo-improve:
-	@echo "Switching to V2 prompt and re-evaluating..."
-	curl -s -X PUT http://localhost:8000/system-prompt \
+demo-recommend:
+	@echo "Generating recommendation via AgentCore Optimization..."
+	curl -s -X POST http://localhost:8000/optimization/recommendations \
 		-H "Content-Type: application/json" \
-		-d '{"version": "v2"}' | python -m json.tool
+		-d '{"evaluator_id": "Builtin.GoalSuccessRate", "lookback_days": 7}' | python -m json.tool
+
+demo-ab-status:
+	@echo "A/B test status..."
+	curl -s http://localhost:8000/optimization/ab-tests | python -m json.tool
+
+demo-deploy:
+	@echo "Optimization status..."
+	curl -s http://localhost:8000/optimization/status | python -m json.tool
+
+demo-optimize:
+	@echo "Full optimization loop: recommend → evaluate..."
+	$(MAKE) demo-recommend
 	@echo ""
-	python evaluation/run_eval.py --version v2 --limit 5
+	@echo "Check Optimization tab in dashboard for progress."
+	@echo "Use 'make demo-ab-status' to monitor A/B test results."
 
 demo-compare:
 	python evaluation/run_eval.py --compare --limit 5
 
 demo-reset:
-	@echo "Resetting to V1 prompt..."
-	curl -s -X PUT http://localhost:8000/system-prompt \
-		-H "Content-Type: application/json" \
-		-d '{"version": "v1"}' | python -m json.tool
+	@echo "Resetting optimization pipeline..."
+	curl -s -X POST http://localhost:8000/optimization/reset \
+		-H "Content-Type: application/json" | python -m json.tool
 
 # === Gateway ===
 gateway-setup:
@@ -111,6 +123,20 @@ anomaly-setup:
 
 observability-setup: dashboard-setup anomaly-setup
 	@echo "CloudWatch dashboard + anomaly alarms configured."
+
+# === Evaluation Infra ===
+eval-role-setup:
+	bash infra/setup_eval_role.sh
+
+# === Cognito Auth ===
+cognito-deploy:
+	bash infra/deploy.sh cognito
+
+cognito-env:
+	bash infra/deploy.sh cognito-env
+
+cognito-outputs:
+	bash infra/deploy.sh cognito-outputs
 
 # === Clean ===
 clean:

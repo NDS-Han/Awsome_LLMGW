@@ -177,6 +177,16 @@ class SessionStore:
         )
         return sessions[:limit]
 
+    def persist(self, session_id: str):
+        """Persist a specific session's current state to DynamoDB."""
+        session = self._sessions.get(session_id)
+        if session:
+            try:
+                from api.persistence import get_persistence
+                get_persistence().persist_session(session)
+            except Exception:
+                pass
+
     def delete(self, session_id: str):
         with self._lock:
             self._sessions.pop(session_id, None)

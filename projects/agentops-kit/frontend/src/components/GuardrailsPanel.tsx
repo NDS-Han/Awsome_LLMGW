@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { ShieldCheck, ShieldAlert, ShieldX, AlertTriangle } from "lucide-react";
+import { ShieldCheck, ShieldAlert, ShieldX, AlertTriangle, Lightbulb, CheckCircle2 } from "lucide-react";
 import { api } from "../api";
 import { GuardrailResult } from "../types";
 
@@ -92,18 +92,8 @@ export default function GuardrailsPanel({ latestGuardrail, compact }: Props) {
             {/* Checks Run */}
             <div style={{ marginBottom: 10, display: "flex", flexWrap: "wrap", gap: 4 }}>
               {(current.checks_run ?? []).map((c) => (
-                <span
-                  key={c}
-                  style={{
-                    fontSize: 10,
-                    padding: "2px 8px",
-                    background: "var(--navy-light)",
-                    borderRadius: 10,
-                    color: "var(--green-light)",
-                    fontFamily: "'JetBrains Mono', monospace",
-                  }}
-                >
-                  ✓ {c}
+                <span key={c} className="badge badge--success badge--mono">
+                  <CheckCircle2 size={9} /> {c}
                 </span>
               ))}
             </div>
@@ -111,8 +101,10 @@ export default function GuardrailsPanel({ latestGuardrail, compact }: Props) {
             {/* Violations */}
             {(current.violations?.length ?? 0) > 0 ? (
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 2 }}>
-                  위반 사항 ({current.violations.length}건)
+                <div className="section-block__title">
+                  <AlertTriangle size={11} />
+                  <span>위반 사항</span>
+                  <span className="badge badge--danger">{current.violations.length}건</span>
                 </div>
                 {current.violations.slice(0, compact ? 3 : 20).map((v, i) => (
                   <div
@@ -127,18 +119,11 @@ export default function GuardrailsPanel({ latestGuardrail, compact }: Props) {
                   >
                     <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 2 }}>
                       {SEVERITY_ICON[v.severity]}
-                      <span
-                        style={{
-                          fontSize: 11,
-                          fontWeight: 600,
-                          color: SEVERITY_COLOR[v.severity],
-                          fontFamily: "'JetBrains Mono', monospace",
-                        }}
-                      >
+                      <span className="badge badge--mono" style={{ background: `${SEVERITY_COLOR[v.severity]}15`, color: SEVERITY_COLOR[v.severity], border: `1px solid ${SEVERITY_COLOR[v.severity]}40` }}>
                         {v.rule_id}
                       </span>
                     </div>
-                    <div style={{ fontSize: 11, color: "var(--gray-300)" }}>{v.message}</div>
+                    <div style={{ fontSize: 11, color: "var(--gray-300)", marginTop: 4 }}>{v.message}</div>
                     {v.matched_text && (
                       <div
                         style={{
@@ -160,10 +145,12 @@ export default function GuardrailsPanel({ latestGuardrail, compact }: Props) {
                           fontSize: 10,
                           marginTop: 4,
                           color: "var(--gray-500)",
-                          fontStyle: "italic",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 4,
                         }}
                       >
-                        → {v.suggestion}
+                        <Lightbulb size={9} /> {v.suggestion}
                       </div>
                     )}
                   </div>
@@ -179,9 +166,13 @@ export default function GuardrailsPanel({ latestGuardrail, compact }: Props) {
                   fontSize: 11,
                   color: "var(--green-light)",
                   textAlign: "center",
+                  display: "flex",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  gap: 6,
                 }}
               >
-                ✓ 모든 가드레일 검사를 통과했습니다
+                <CheckCircle2 size={13} /> 모든 가드레일 검사를 통과했습니다
               </div>
             )}
 

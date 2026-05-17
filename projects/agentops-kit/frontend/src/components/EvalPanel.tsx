@@ -1,860 +1,798 @@
-import { useState } from "react";
-import { Shield, PlayCircle, ArrowRightLeft, TrendingUp, Zap, Search, Lightbulb, CheckCircle2, RotateCcw, ChevronDown, ChevronRight, AlertTriangle, Loader2 } from "lucide-react";
+import { useState, useEffect, useCallback } from "react";
+import { api } from "../api";
 import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-  Cell,
-  AreaChart,
-  Area,
+  Shield, PlayCircle, Plus, Trash2, ToggleLeft, ToggleRight,
+  RefreshCw, Loader2, CheckCircle2, AlertTriangle, Zap, Activity,
+  ChevronDown, ChevronRight, Settings2, List, Layers, Clock, Hash, Percent,
+} from "lucide-react";
+import {
+  BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell,
 } from "recharts";
-import { EvalEntry, EvalResult, TurnEvalResult, TurnEvalScore, ImprovementState, EvalAnalysis } from "../types";
+import {
+  Evaluator, OnlineEvalConfig, OnlineEvalResults, EvalResultEntry,
+  BatchEvalSummary, BatchEvalDetail,
+} from "../types";
 
 interface Props {
-  evalHistory: EvalEntry[];
-  promptVersion: string;
-  onSwitchPrompt: (version: string) => void;
-  onRunEval: () => void;
-  isEvalRunning?: boolean;
-  turnEvals: Record<string, TurnEvalResult>;
-  turnEvalOrder: string[];
-  improvementState: ImprovementState;
-  onApplyImprovement: () => void;
-  onResetImprovement: () => void;
-  evalAnalysis: EvalAnalysis | null;
   compact?: boolean;
 }
 
-type SubTab = "overview" | "analysis" | "deepdive";
+type SubTab = "online" | "batch" | "evaluators";
 
 function scoreColor(score: number): string {
-  if (score >= 0.8) return "var(--green-light)";
-  if (score >= 0.6) return "var(--amber)";
-  return "var(--red-light)";
-}
-
-function scoreBarColor(score: number): string {
   if (score >= 0.8) return "#6aaf35";
   if (score >= 0.6) return "#ff9900";
   return "#e74c3c";
 }
 
-function scoreClass(score: number): string {
-  if (score >= 0.8) return "high";
-  if (score >= 0.6) return "medium";
-  return "low";
+function scoreLabel(score: number): string {
+  if (score >= 0.9) return "Excellent";
+  if (score >= 0.8) return "Very Good";
+  if (score >= 0.6) return "Good";
+  if (score >= 0.4) return "Fair";
+  return "Poor";
 }
 
-const TOOL_COLORS: Record<string, string> = {
-  query_sales_data: "#ff9900",
-  analyze_reviews: "#0073bb",
-  check_delivery_performance: "#6aaf35",
-  get_seller_metrics: "#44b9d6",
-  text2sql_query: "#8b5cf6",
-  delegate_to_specialist: "#ec4899",
-};
-
-const CATEGORY_COLORS: Record<string, string> = {
-  sales: "#ff9900",
-  reviews: "#0073bb",
-  delivery: "#6aaf35",
-  sellers: "#44b9d6",
-  general: "#6b7280",
-};
-
-// --- Turn Detail (Analysis tab) ---
-
-function TurnDetailRow({ turn, index }: { turn: TurnEvalResult; index: number }) {
-  const [expanded, setExpanded] = useState(false);
-  const [showPrompt, setShowPrompt] = useState(false);
-  const [showResponse, setShowResponse] = useState(false);
+function ScoreGauge({ score, size = 56 }: { score: number; size?: number }) {
+  const radius = (size - 8) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const filled = circumference * score;
+  const color = scoreColor(score);
 
   return (
-    <div style={{ marginBottom: 6, border: "1px solid var(--navy-light)", borderRadius: "var(--radius)", overflow: "hidden" }}>
-      <div
-        onClick={() => setExpanded(!expanded)}
-        style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", cursor: "pointer", background: "rgba(255,255,255,0.02)" }}
-      >
-        {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        <span style={{ fontSize: 11, color: "var(--gray-300)", width: 24 }}>#{index + 1}</span>
-        <span className={`eval-score ${scoreClass(turn.avg_score)}`} style={{ fontSize: 11 }}>
-          {(turn.avg_score * 100).toFixed(0)}%
-        </span>
-        {turn.category && (
-          <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 3, background: CATEGORY_COLORS[turn.category] || "#6b7280", color: "#fff", fontWeight: 500 }}>
-            {turn.category}
-          </span>
-        )}
-        <span style={{ fontSize: 10, color: "var(--gray-500)", marginLeft: "auto" }}>
-          {turn.prompt_version.toUpperCase()}
-        </span>
+    <div className="eval-gauge">
+      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+        <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke="rgba(59, 80, 109, 0.4)" strokeWidth={4} />
+        <circle cx={size / 2} cy={size / 2} r={radius} fill="none" stroke={color} strokeWidth={4}
+          strokeDasharray={`${filled} ${circumference}`} strokeLinecap="round"
+          transform={`rotate(-90 ${size / 2} ${size / 2})`} style={{ transition: "stroke-dasharray 0.6s ease" }} />
+      </svg>
+      <div className="eval-gauge__value" style={{ color }}>{(score * 100).toFixed(0)}</div>
+    </div>
+  );
+}
+
+function StatusBadge({ status }: { status: string }) {
+  const color = status === "ACTIVE" || status === "ENABLED" ? "#6aaf35"
+    : status === "CREATING" || status === "IN_PROGRESS" ? "#ff9900"
+    : status === "DISABLED" ? "#6b7280"
+    : "#e74c3c";
+  return <span className="eval-status-badge" style={{ background: `${color}22`, color, borderColor: `${color}44` }}>{status}</span>;
+}
+
+// --- Online Config Card ---
+
+function OnlineConfigCard({
+  config, onToggle, onDelete,
+}: {
+  config: OnlineEvalConfig;
+  onRefreshResults: (configId: string) => void;
+  onToggle: (configId: string, enabled: boolean) => void;
+  onDelete: (configId: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [results, setResults] = useState<OnlineEvalResults | null>(null);
+  const [loading, setLoading] = useState(false);
+  const isEnabled = config.execution_status === "ENABLED";
+
+  const fetchResults = async () => {
+    setLoading(true);
+    try {
+      const data = await api.getOnlineResults(config.config_id, 24);
+      setResults(data);
+    } catch { /* ignore */ }
+    setLoading(false);
+  };
+
+  const handleToggle = () => {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && !results) {
+      fetchResults();
+    }
+  };
+
+  return (
+    <div className="eval-config-card">
+      <div className="eval-config-card__header" onClick={handleToggle}>
+        <div className="eval-config-card__left">
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <span className="eval-config-card__name">{config.config_name}</span>
+          <StatusBadge status={config.execution_status} />
+        </div>
+        <div className="eval-config-card__right">
+          <span className="eval-config-card__sampling">{config.sampling_rate}%</span>
+          <button className="btn-icon" title={isEnabled ? "비활성화" : "활성화"}
+            onClick={(e) => { e.stopPropagation(); onToggle(config.config_id, !isEnabled); }}>
+            {isEnabled ? <ToggleRight size={16} style={{ color: "#6aaf35" }} /> : <ToggleLeft size={16} style={{ color: "#6b7280" }} />}
+          </button>
+          <button className="btn-icon" title="결과 새로고침" onClick={(e) => { e.stopPropagation(); fetchResults(); }}>
+            <RefreshCw size={13} />
+          </button>
+          <button className="btn-icon btn-icon--danger" title="삭제" onClick={(e) => { e.stopPropagation(); onDelete(config.config_id); }}>
+            <Trash2 size={13} />
+          </button>
+        </div>
       </div>
       {expanded && (
-        <div style={{ padding: "8px 10px", borderTop: "1px solid var(--navy-light)" }}>
-          {/* Collapsible prompt */}
-          {turn.prompt && (
-            <div style={{ marginBottom: 6 }}>
-              <div
-                onClick={() => setShowPrompt(!showPrompt)}
-                style={{ fontSize: 10, color: "var(--gray-500)", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}
-              >
-                {showPrompt ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-                Prompt
-              </div>
-              {showPrompt && (
-                <div style={{ fontSize: 11, color: "var(--gray-300)", padding: "4px 8px", background: "var(--navy-light)", borderRadius: 4, whiteSpace: "pre-wrap", maxHeight: 120, overflow: "auto" }}>
-                  {turn.prompt}
-                </div>
-              )}
+        <div className="eval-config-card__body">
+          <div className="eval-config-card__details">
+            <div className="info-row">
+              <span className="info-row__icon"><Shield size={10} /></span>
+              <span className="info-row__label">평가기</span>
+              <span style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+                {config.evaluators.map(e => (
+                  <span key={e} className="badge badge--info badge--mono">{e.replace("Builtin.", "")}</span>
+                ))}
+              </span>
+            </div>
+            <div className="info-row">
+              <span className="info-row__icon"><Percent size={10} /></span>
+              <span className="info-row__label">샘플링</span>
+              <span className="info-row__value">{config.sampling_rate}%</span>
+            </div>
+            <div className="info-row">
+              <span className="info-row__icon"><Clock size={10} /></span>
+              <span className="info-row__label">생성</span>
+              <span className="info-row__value">{config.created_at ? new Date(config.created_at).toLocaleString() : "—"}</span>
+            </div>
+          </div>
+          {loading && (
+            <div style={{ textAlign: "center", padding: 12 }}><Loader2 size={14} className="spin" /></div>
+          )}
+          {results && <ResultsView results={results} configName={config.config_name} />}
+          {!loading && !results && (
+            <div style={{ textAlign: "center", padding: 8, fontSize: 11, color: "var(--gray-500)" }}>
+              결과를 불러오는 중...
             </div>
           )}
+        </div>
+      )}
+    </div>
+  );
+}
 
-          {/* Collapsible response */}
-          {turn.response && (
-            <div style={{ marginBottom: 8 }}>
-              <div
-                onClick={() => setShowResponse(!showResponse)}
-                style={{ fontSize: 10, color: "var(--gray-500)", cursor: "pointer", display: "flex", alignItems: "center", gap: 4, marginBottom: 2 }}
-              >
-                {showResponse ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
-                Response
-              </div>
-              {showResponse && (
-                <div style={{ fontSize: 11, color: "var(--gray-300)", padding: "4px 8px", background: "var(--navy-light)", borderRadius: 4, whiteSpace: "pre-wrap", maxHeight: 150, overflow: "auto" }}>
-                  {turn.response}
+// --- Results View ---
+
+function ResultsView({ results, configName }: { results: OnlineEvalResults; configName: string }) {
+  if (results.error) {
+    return <div className="eval-error">{results.error}</div>;
+  }
+
+  const { summary } = results;
+  if (!summary || summary.count === 0) {
+    return (
+      <div className="empty-state" style={{ minHeight: 80 }}>
+        <Activity size={20} />
+        <p>아직 평가 결과가 없습니다</p>
+        <p className="empty-hint">에이전트에 트래픽이 발생하면 자동으로 평가됩니다</p>
+      </div>
+    );
+  }
+
+  const evaluatorData = Object.entries(summary.by_evaluator).map(([id, d]) => ({
+    name: id.replace("Builtin.", ""),
+    avg: d.avg_score,
+    count: d.count,
+    min: d.min_score,
+    max: d.max_score,
+  })).sort((a, b) => a.avg - b.avg);
+
+
+  return (
+    <div className="eval-results-view">
+      <div className="eval-results-view__header">
+        <span>{configName} — 결과 요약</span>
+        <span className="eval-results-view__count">{summary.count}건</span>
+      </div>
+
+      <div className="eval-summary-card">
+        <div className="eval-summary-card__left">
+          <ScoreGauge score={summary.avg_score} />
+          <div className="eval-summary-card__info">
+            <div className="eval-summary-card__label">{scoreLabel(summary.avg_score)}</div>
+            <div className="eval-summary-card__meta">{summary.count}건 평가</div>
+          </div>
+        </div>
+      </div>
+
+      {evaluatorData.length > 0 && (
+        <div className="eval-analysis-block">
+          <div className="eval-analysis-block__title">평가기별 평균 점수</div>
+          <div className="eval-batch-detail__cards">
+            {evaluatorData.map(e => (
+              <div key={e.name} className="eval-batch-detail__score-card">
+                <div className="eval-batch-detail__score-card-name">{e.name}</div>
+                <div className="eval-batch-detail__score-card-value" style={{ color: scoreColor(e.avg) }}>
+                  {(e.avg * 100).toFixed(1)}%
                 </div>
+                <div className="eval-batch-detail__score-card-meta">
+                  {e.count}건 평가
+                </div>
+                <div className="eval-batch-detail__score-card-range">
+                  {(e.min * 100).toFixed(0)}% ~ {(e.max * 100).toFixed(0)}%
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {(() => {
+        // Group by session for trend chart
+        const sessionMap = new Map<string, { scores: number[]; timestamp: string }>();
+        for (const r of results.results) {
+          const key = r.session_id || r.trace_id || "unknown";
+          if (!sessionMap.has(key)) sessionMap.set(key, { scores: [], timestamp: r.timestamp || "" });
+          if (r.score !== null) sessionMap.get(key)!.scores.push(r.score);
+        }
+        const trendData = [...sessionMap.entries()]
+          .map(([id, { scores, timestamp }]) => ({
+            session: id.slice(0, 6),
+            avg: scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0,
+            time: timestamp ? new Date(timestamp).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "",
+          }))
+          .sort((a, b) => a.time.localeCompare(b.time));
+
+        if (trendData.length < 2) return null;
+        return (
+          <div className="eval-analysis-block">
+            <div className="eval-analysis-block__title">세션별 평균 점수 추세</div>
+            <ResponsiveContainer width="100%" height={120}>
+              <BarChart data={trendData} margin={{ top: 16, right: 8, left: 0, bottom: 20 }}>
+                <XAxis dataKey="time" tick={{ fontSize: 10, fill: "#c4cdd3" }} axisLine={false} tickLine={false} interval={0} />
+                <YAxis domain={[0, 1]} tick={{ fontSize: 10, fill: "#879596" }} axisLine={false} tickLine={false} width={32} tickFormatter={(v) => `${(v * 100).toFixed(0)}%`} />
+                <Tooltip
+                  contentStyle={{ background: "rgba(20, 28, 44, 0.95)", border: "1px solid #3b506d", borderRadius: 6, fontSize: 12 }}
+                  formatter={(value: number) => [`${(value * 100).toFixed(1)}%`, "세션 평균"]}
+                  labelFormatter={(time) => String(time)}
+                />
+                <Bar dataKey="avg" radius={[4, 4, 0, 0]} label={{ position: "top", fontSize: 11, fill: "#c4cdd3", formatter: (v: number) => `${(v * 100).toFixed(0)}%` }}>
+                  {trendData.map((d, i) => <Cell key={i} fill={scoreColor(d.avg)} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        );
+      })()}
+
+      <OnlineResultsList results={results.results} />
+    </div>
+  );
+}
+
+function OnlineResultsList({ results }: { results: EvalResultEntry[] }) {
+  if (!results || results.length === 0) return null;
+
+  // Group by session/trace
+  const grouped = new Map<string, EvalResultEntry[]>();
+  for (const r of results) {
+    const key = r.session_id || r.trace_id || "unknown";
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key)!.push(r);
+  }
+  // Sort groups by most recent timestamp
+  const groups = [...grouped.entries()].sort((a, b) => {
+    const tA = a[1][0]?.timestamp || "";
+    const tB = b[1][0]?.timestamp || "";
+    return tB.localeCompare(tA);
+  });
+
+  return (
+    <div className="eval-batch-detail__results-section">
+      <div className="eval-batch-detail__results-section-title">
+        평가 결과 상세 ({groups.length}개 세션, {results.length}건)
+      </div>
+      <div className="eval-online-results-grouped">
+        {groups.slice(0, 20).map(([sessionId, items]) => (
+          <SessionResultGroup key={sessionId} sessionId={sessionId} items={items} />
+        ))}
+        {groups.length > 20 && (
+          <div className="eval-batch-detail__more">외 {groups.length - 20}개 세션</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SessionResultGroup({ sessionId, items }: { sessionId: string; items: EvalResultEntry[] }) {
+  const [open, setOpen] = useState(false);
+  const avgScore = items.reduce((sum, r) => sum + (r.score ?? 0), 0) / items.length;
+  const timestamp = items[0]?.timestamp;
+
+  return (
+    <div className="eval-session-group">
+      <div className="eval-session-group__header" onClick={() => setOpen(!open)}>
+        <div className="eval-session-group__left">
+          {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <span className="eval-session-group__id">{sessionId.slice(0, 12)}</span>
+          <span className="eval-session-group__avg" style={{ color: scoreColor(avgScore) }}>
+            평균 {(avgScore * 100).toFixed(0)}%
+          </span>
+          <span className="eval-session-group__count">{items.length}개 평가</span>
+        </div>
+        {timestamp && (
+          <span className="eval-session-group__time">{new Date(timestamp).toLocaleString()}</span>
+        )}
+      </div>
+      {open && (
+        <div className="eval-session-group__body">
+          {items.map((r, i) => (
+            <div key={i} className="eval-online-result-item">
+              <div className="eval-online-result-item__header">
+                <span className="eval-online-result-item__evaluator">{r.evaluator_id.replace("Builtin.", "")}</span>
+                <span style={{ color: scoreColor(r.score ?? 0), fontWeight: 600 }}>
+                  {r.score !== null ? `${(r.score * 100).toFixed(0)}%` : "—"}
+                </span>
+                {r.label && <span className="eval-online-result-item__label">{r.label}</span>}
+              </div>
+              {r.explanation && (
+                <div className="eval-online-result-item__explanation">{r.explanation}</div>
               )}
             </div>
-          )}
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 
-          {/* Per-evaluator scores + explanation */}
-          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-            {turn.scores.map((s: TurnEvalScore) => (
-              <div key={s.evaluator} style={{ padding: "4px 8px", background: "rgba(255,255,255,0.02)", borderRadius: 4 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11 }}>
-                  <span style={{ color: "var(--gray-400)", flex: 1 }}>{s.evaluator.replace("Builtin.", "")}</span>
-                  <span style={{ color: scoreBarColor(s.score), fontWeight: 600 }}>{(s.score * 100).toFixed(0)}%</span>
-                  {s.eval_source === "custom" && (
-                    <span style={{ fontSize: 9, padding: "0 4px", borderRadius: 3, background: "rgba(139,92,246,0.2)", color: "#8b5cf6" }}>custom</span>
+// --- Create Config Dialog ---
+
+function CreateConfigForm({
+  evaluators, onClose, onCreated,
+}: {
+  evaluators: Evaluator[];
+  onClose: () => void;
+  onCreated: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [samplingRate, setSamplingRate] = useState(100);
+  const [selectedEvals, setSelectedEvals] = useState<string[]>([
+    "Builtin.Helpfulness", "Builtin.Correctness", "Builtin.GoalSuccessRate",
+  ]);
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const toggleEval = (id: string) => {
+    setSelectedEvals(prev => prev.includes(id) ? prev.filter(e => e !== id) : [...prev, id]);
+  };
+
+  const handleCreate = async () => {
+    if (!name.trim()) { setError("이름을 입력하세요"); return; }
+    if (selectedEvals.length === 0) { setError("평가기를 1개 이상 선택하세요"); return; }
+    setCreating(true);
+    setError(null);
+    try {
+      await api.createOnlineConfig({ name: name.trim(), evaluator_ids: selectedEvals, sampling_rate: samplingRate, description: description.trim() || undefined });
+      onCreated();
+      onClose();
+    } catch (e: any) {
+      setError(e.message || "생성 실패");
+    } finally {
+      setCreating(false);
+    }
+  };
+
+  return (
+    <div className="eval-create-form">
+      <div className="eval-create-form__title">
+        <Settings2 size={13} /> 온라인 평가 설정 생성
+      </div>
+      <div className="eval-create-form__field">
+        <label>이름</label>
+        <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="e.g. production-eval" />
+      </div>
+      <div className="eval-create-form__field">
+        <label>설명 (선택)</label>
+        <input type="text" value={description} onChange={e => setDescription(e.target.value)} placeholder="설명" />
+      </div>
+      <div className="eval-create-form__field">
+        <label>샘플링 비율: {samplingRate}%</label>
+        <input type="range" min={1} max={100} value={samplingRate} onChange={e => setSamplingRate(Number(e.target.value))} />
+      </div>
+      <div className="eval-create-form__field">
+        <label>평가기 선택</label>
+        <div className="eval-create-form__evaluators">
+          {evaluators.filter(e => e.status === "ACTIVE").map(ev => (
+            <label key={ev.evaluator_id} className="eval-create-form__eval-item">
+              <input type="checkbox" checked={selectedEvals.includes(ev.evaluator_id)} onChange={() => toggleEval(ev.evaluator_id)} />
+              <span>{ev.name.replace("Builtin.", "")}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+      {error && <div className="eval-error">{error}</div>}
+      <div className="eval-create-form__actions">
+        <button className="btn btn-sm" onClick={onClose}>취소</button>
+        <button className="btn btn-primary btn-sm" onClick={handleCreate} disabled={creating}>
+          {creating ? <Loader2 size={12} className="spin" /> : <Plus size={12} />}
+          생성
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// --- Batch Eval Card (collapsible like OnlineConfigCard) ---
+
+function BatchCard({ batch, onViewDetail }: { batch: BatchEvalSummary; onViewDetail: (id: string) => void }) {
+  const [expanded, setExpanded] = useState(false);
+  const [detail, setDetail] = useState<BatchEvalDetail | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const handleToggle = async () => {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && !detail) {
+      setLoading(true);
+      try {
+        const d = await api.getBatchEval(batch.batch_id);
+        setDetail(d);
+        onViewDetail(batch.batch_id);
+      } catch { /* ignore */ }
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="eval-config-card">
+      <div className="eval-config-card__header" onClick={handleToggle}>
+        <div className="eval-config-card__left">
+          {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+          <span className="eval-config-card__name">{batch.name || batch.batch_id.slice(0, 8)}</span>
+          <StatusBadge status={batch.status} />
+        </div>
+        <div className="eval-config-card__right">
+          <span style={{ fontSize: 11, color: "#9ca3af" }}>
+            {batch.created_at ? new Date(batch.created_at).toLocaleString() : ""}
+          </span>
+        </div>
+      </div>
+      {expanded && (
+        <div className="eval-config-card__body">
+          {loading ? (
+            <div style={{ textAlign: "center", padding: 12 }}><Loader2 size={14} className="spin" /></div>
+          ) : detail ? (
+            <BatchDetailBody detail={detail} />
+          ) : null}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function BatchDetailBody({ detail }: { detail: BatchEvalDetail }) {
+  const [showResults, setShowResults] = useState(false);
+  const total = detail.total_sessions;
+  const progress = total > 0 ? ((detail.sessions_completed / total) * 100).toFixed(0) : "0";
+  const byEvaluator = detail.results_summary?.by_evaluator;
+  const isCompleted = detail.status === "COMPLETED";
+  const isRunning = detail.status === "IN_PROGRESS" || detail.status === "STARTING";
+
+  return (
+    <>
+      {/* Meta Info */}
+      <div className="eval-batch-detail__meta">
+        <span className="badge badge--neutral badge--mono"><Hash size={9} /> {detail.batch_id.slice(0, 12)}</span>
+        <span className="badge badge--neutral"><Clock size={9} /> {detail.created_at ? new Date(detail.created_at).toLocaleString() : "—"}</span>
+        <span className="badge badge--neutral"><Layers size={9} /> {total}개 세션</span>
+      </div>
+
+      {/* Progress */}
+      <div className="eval-batch-detail__progress">
+        <div className="eval-batch-detail__progress-bar">
+          <div style={{ width: `${progress}%`, background: isCompleted ? "#6aaf35" : "#ff9900" }} />
+        </div>
+        <span>
+          {isCompleted ? `${total}/${total} 완료` : `${detail.sessions_completed}/${total} (${progress}%)`}
+        </span>
+        {detail.sessions_failed > 0 && (
+          <span style={{ color: "#e74c3c", marginLeft: 8 }}>
+            <AlertTriangle size={11} /> {detail.sessions_failed} 실패
+          </span>
+        )}
+        {isRunning && detail.sessions_in_progress > 0 && (
+          <span style={{ color: "#ff9900", marginLeft: 8 }}>
+            <Loader2 size={11} className="spin" /> {detail.sessions_in_progress} 진행 중
+          </span>
+        )}
+      </div>
+
+      {/* Evaluator Summary Cards */}
+      {detail.evaluator_summaries.length > 0 && (
+        <div className="eval-batch-detail__cards">
+          {detail.evaluator_summaries.map(s => {
+            const extra = byEvaluator?.[s.evaluator_id];
+            return (
+              <div key={s.evaluator_id} className="eval-batch-detail__score-card">
+                <div className="eval-batch-detail__score-card-name">
+                  {s.evaluator_id.replace("Builtin.", "")}
+                </div>
+                <div className="eval-batch-detail__score-card-value" style={{ color: scoreColor(s.average_score) }}>
+                  {(s.average_score * 100).toFixed(1)}%
+                </div>
+                <div className="eval-batch-detail__score-card-meta">
+                  {s.total_evaluated}건 평가{s.total_failed > 0 ? ` · ${s.total_failed} 실패` : ""}
+                </div>
+                {extra && (
+                  <div className="eval-batch-detail__score-card-range">
+                    {(extra.min_score * 100).toFixed(0)}% ~ {(extra.max_score * 100).toFixed(0)}%
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* No evaluator data yet */}
+      {detail.evaluator_summaries.length === 0 && isRunning && (
+        <div style={{ textAlign: "center", padding: 12, fontSize: 11, color: "var(--gray-500)" }}>
+          <Loader2 size={14} className="spin" style={{ marginBottom: 4 }} /><br />
+          평가 진행 중입니다...
+        </div>
+      )}
+
+      {detail.evaluator_summaries.length === 0 && isCompleted && (
+        <div style={{ textAlign: "center", padding: 12, fontSize: 11, color: "var(--gray-500)" }}>
+          평가 결과가 없습니다
+        </div>
+      )}
+
+      {/* Session Results (collapsible) */}
+      {detail.results && detail.results.length > 0 && (
+        <div className="eval-batch-detail__results-section">
+          <div className="eval-batch-detail__results-toggle" onClick={() => setShowResults(!showResults)}>
+            {showResults ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+            <span>세션별 결과 ({detail.results.length}건)</span>
+          </div>
+          {showResults && (
+            <div className="eval-batch-detail__result-list">
+              {detail.results.slice(0, 30).map((r, i) => (
+                <div key={i} className="eval-batch-detail__result-item">
+                  <span className="eval-batch-detail__result-evaluator">{r.evaluator_id.replace("Builtin.", "")}</span>
+                  <span style={{ color: scoreColor(r.score ?? 0), fontWeight: 600 }}>
+                    {r.score !== null ? `${(r.score * 100).toFixed(0)}%` : "—"}
+                  </span>
+                  <span className="eval-batch-detail__result-session" title={r.session_id}>
+                    {r.session_id?.slice(0, 8) || "—"}
+                  </span>
+                  {r.explanation && (
+                    <span className="eval-batch-detail__result-explanation" title={r.explanation}>
+                      {r.explanation.slice(0, 80)}{r.explanation.length > 80 ? "…" : ""}
+                    </span>
                   )}
                 </div>
-                {s.explanation && (
-                  <div style={{ fontSize: 10, color: "var(--gray-500)", marginTop: 2, lineHeight: 1.4 }}>
-                    {s.explanation}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-// --- Sub-components ---
-
-function EvalResultRow({ result }: { result: EvalResult }) {
-  const displayName = result.evaluator.replace("Builtin.", "");
-  return (
-    <div className="eval-row">
-      <div className="eval-row-header">
-        <span className="eval-name">{displayName}</span>
-        <span className={`eval-score ${scoreClass(result.score)}`}>
-          {(result.score * 100).toFixed(1)}%
-        </span>
-      </div>
-      <div className="eval-bar-bg">
-        <div
-          className="eval-bar-fill"
-          style={{
-            width: `${result.score * 100}%`,
-            background: scoreColor(result.score),
-          }}
-        />
-      </div>
-      <div className="eval-explanation">{result.explanation}</div>
-    </div>
-  );
-}
-
-const PIPELINE_STAGES = [
-  { key: "evaluate", label: "평가", icon: Zap },
-  { key: "analyze", label: "분석", icon: Search },
-  { key: "suggest", label: "제안", icon: Lightbulb },
-  { key: "apply", label: "적용", icon: CheckCircle2 },
-];
-
-function stageIndex(status: string): number {
-  switch (status) {
-    case "idle": return 0;
-    case "analyzing": return 1;
-    case "ready": return 2;
-    case "applied": return 3;
-    default: return 0;
-  }
-}
-
-function ImprovementPipeline({
-  state,
-  onApply,
-  onReset,
-}: {
-  state: ImprovementState;
-  onApply: () => void;
-  onReset: () => void;
-}) {
-  const idx = stageIndex(state.status);
-
-  return (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-        <TrendingUp size={12} />
-        프롬프트 개선 파이프라인
-      </div>
-      <div style={{ display: "flex", alignItems: "center", gap: 4, marginBottom: 8 }}>
-        {PIPELINE_STAGES.map((stage, i) => {
-          const Icon = stage.icon;
-          const active = i <= idx;
-          const current = i === idx;
-          return (
-            <div key={stage.key} style={{ display: "flex", alignItems: "center", gap: 4 }}>
-              <div
-                style={{
-                  display: "flex", alignItems: "center", gap: 4, padding: "3px 8px",
-                  borderRadius: 4, fontSize: 10, fontWeight: current ? 600 : 400,
-                  background: active ? "rgba(106, 175, 53, 0.15)" : "var(--navy-light)",
-                  color: active ? "var(--green-light)" : "var(--gray-500)",
-                  border: current ? "1px solid rgba(106, 175, 53, 0.4)" : "1px solid transparent",
-                }}
-              >
-                <Icon size={10} />
-                {stage.label}
-              </div>
-              {i < PIPELINE_STAGES.length - 1 && (
-                <div style={{ width: 12, height: 1, background: active ? "var(--green-light)" : "var(--gray-600)" }} />
-              )}
-            </div>
-          );
-        })}
-      </div>
-
-      {state.status === "ready" && state.suggestion && (
-        <div style={{ padding: "8px 12px", background: "rgba(255, 153, 0, 0.08)", border: "1px solid rgba(255, 153, 0, 0.3)", borderRadius: "var(--radius)", marginBottom: 8 }}>
-          <div style={{ fontSize: 11, fontWeight: 600, color: "var(--amber)", marginBottom: 6 }}>
-            제안: {state.suggestion.suggested_version.toUpperCase()}로 전환 (예상 변화 {state.suggestion.expected_delta})
-          </div>
-          <div style={{ fontSize: 10, color: "var(--gray-400)", marginBottom: 6 }}>{state.suggestion.reason}</div>
-          <table style={{ width: "100%", fontSize: 10, borderCollapse: "collapse" }}>
-            <thead><tr style={{ color: "var(--gray-500)" }}><th style={{ textAlign: "left", padding: "2px 4px" }}>항목</th><th style={{ textAlign: "left", padding: "2px 4px" }}>이전</th><th style={{ textAlign: "left", padding: "2px 4px" }}>이후</th></tr></thead>
-            <tbody>
-              {state.suggestion.changes.map((c) => (
-                <tr key={c.aspect} style={{ color: "var(--gray-300)" }}>
-                  <td style={{ padding: "2px 4px", fontWeight: 500 }}>{c.aspect}</td>
-                  <td style={{ padding: "2px 4px", color: "var(--red-light)" }}>{c.before}</td>
-                  <td style={{ padding: "2px 4px", color: "var(--green-light)" }}>{c.after}</td>
-                </tr>
               ))}
-            </tbody>
-          </table>
-          <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-            <button className="btn btn-primary btn-sm" onClick={onApply}>개선 적용</button>
-            <button className="btn btn-sm" onClick={onReset} style={{ opacity: 0.7 }}><RotateCcw size={10} /> 초기화</button>
-          </div>
-        </div>
-      )}
-
-      {state.status === "applied" && (
-        <div style={{ padding: "6px 10px", background: "rgba(106, 175, 53, 0.1)", border: "1px solid rgba(106, 175, 53, 0.3)", borderRadius: "var(--radius)", fontSize: 11, color: "var(--green-light)", display: "flex", alignItems: "center", gap: 8 }}>
-          <CheckCircle2 size={12} />
-          <span>개선이 적용되었습니다. 이전: {((state.before_score || 0) * 100).toFixed(0)}%</span>
-          {state.after_score != null && (
-            <span style={{ fontWeight: 600 }}>
-              → 이후: {(state.after_score * 100).toFixed(0)}%
-              {" "}(+{((state.after_score - (state.before_score || 0)) * 100).toFixed(0)}%)
-            </span>
-          )}
-          <button className="btn btn-sm" onClick={onReset} style={{ marginLeft: "auto", opacity: 0.7, fontSize: 10 }}><RotateCcw size={10} /></button>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function TurnTrendChart({ turnEvalOrder, turnEvals }: { turnEvalOrder: string[]; turnEvals: Record<string, TurnEvalResult> }) {
-  const chartData = turnEvalOrder
-    .map((tid, i) => {
-      const ev = turnEvals[tid];
-      if (!ev) return null;
-      return { name: `T${i + 1}`, score: Math.round(ev.avg_score * 100), version: ev.prompt_version, raw: ev.avg_score };
-    })
-    .filter(Boolean) as { name: string; score: number; version: string; raw: number }[];
-
-  if (chartData.length === 0) return null;
-
-  return (
-    <div style={{ marginBottom: 14 }}>
-      <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 6 }}>턴별 평가 추세</div>
-      <ResponsiveContainer width="100%" height={100}>
-        <BarChart data={chartData} barCategoryGap="20%">
-          <XAxis dataKey="name" tick={{ fontSize: 10, fill: "#999" }} axisLine={false} tickLine={false} />
-          <YAxis domain={[0, 100]} tick={{ fontSize: 10, fill: "#999" }} axisLine={false} tickLine={false} width={30} />
-          <Tooltip
-            contentStyle={{ background: "#1a2332", border: "1px solid #2a3a4a", borderRadius: 6, fontSize: 11 }}
-            formatter={(value: number, _name: string, props: any) => [`${value}% (${props.payload.version})`, "Score"]}
-          />
-          <Bar dataKey="score" radius={[3, 3, 0, 0]}>
-            {chartData.map((entry, i) => (
-              <Cell key={i} fill={scoreBarColor(entry.raw)} />
-            ))}
-          </Bar>
-        </BarChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
-// --- Analysis Tab ---
-
-function CategoryScoreChart({ analysis }: { analysis: EvalAnalysis }) {
-  const data = Object.entries(analysis.by_category).map(([cat, d]) => ({
-    name: cat.charAt(0).toUpperCase() + cat.slice(1),
-    score: Math.round(d.avg_score * 100),
-    count: d.count,
-    raw: d.avg_score,
-    color: CATEGORY_COLORS[cat] || "#6b7280",
-  })).sort((a, b) => b.score - a.score);
-
-  if (data.length === 0) return <div style={{ fontSize: 11, color: "var(--gray-500)", padding: 8 }}>아직 카테고리 데이터가 없습니다.</div>;
-
-  return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 6 }}>질문 카테고리별 점수</div>
-      <ResponsiveContainer width="100%" height={Math.max(80, data.length * 32)}>
-        <BarChart data={data} layout="vertical" barCategoryGap="25%" margin={{ left: 0, right: 8 }}>
-          <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 10, fill: "#999" }} axisLine={false} tickLine={false} />
-          <YAxis type="category" dataKey="name" tick={{ fontSize: 10, fill: "#bbb" }} axisLine={false} tickLine={false} width={70} />
-          <Tooltip
-            contentStyle={{ background: "#1a2332", border: "1px solid #2a3a4a", borderRadius: 6, fontSize: 11 }}
-            formatter={(value: number, _: string, props: any) => [`${value}% (${props.payload.count}턴)`, "평균 점수"]}
-          />
-          <Bar dataKey="score" radius={[0, 3, 3, 0]}>
-            {data.map((entry, i) => <Cell key={i} fill={entry.color} />)}
-          </Bar>
-        </BarChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
-function EvaluatorLeaderboard({ analysis }: { analysis: EvalAnalysis }) {
-  const evaluators = Object.entries(analysis.by_evaluator)
-    .map(([name, d]) => ({ name: name.replace("Builtin.", ""), avg_score: d.avg_score, trend: d.trend, count: d.count }))
-    .sort((a, b) => a.avg_score - b.avg_score);
-
-  if (evaluators.length === 0) return null;
-
-  return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 6 }}>평가기 순위 (낮은 순)</div>
-      {evaluators.map((ev) => (
-        <div key={ev.name} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-          <span style={{ fontSize: 11, color: "var(--gray-300)", width: 130, flexShrink: 0 }}>{ev.name}</span>
-          <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 6 }}>
-            <div style={{ width: 80, height: 4, background: "var(--navy-light)", borderRadius: 2, overflow: "hidden" }}>
-              <div style={{ width: `${ev.avg_score * 100}%`, height: "100%", background: scoreBarColor(ev.avg_score), borderRadius: 2 }} />
-            </div>
-            {ev.trend.length > 1 && (
-              <div style={{ width: 60, height: 24 }}>
-                <ResponsiveContainer width="100%" height="100%">
-                  <AreaChart data={ev.trend.slice(-10).map((v, i) => ({ i, v: Math.round(v * 100) }))}>
-                    <Area type="monotone" dataKey="v" stroke={scoreBarColor(ev.avg_score)} fill={scoreBarColor(ev.avg_score)} fillOpacity={0.2} strokeWidth={1} dot={false} />
-                  </AreaChart>
-                </ResponsiveContainer>
-              </div>
-            )}
-          </div>
-          <span className={`eval-score ${scoreClass(ev.avg_score)}`} style={{ fontSize: 11, minWidth: 40, textAlign: "right" }}>
-            {(ev.avg_score * 100).toFixed(0)}%
-          </span>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function TimeTrendChart({ analysis }: { analysis: EvalAnalysis }) {
-  const data = analysis.time_trend.map((t, i) => ({
-    name: `T${i + 1}`,
-    score: Math.round(t.avg_score * 100),
-    version: t.prompt_version,
-    category: t.category,
-  }));
-
-  if (data.length === 0) return null;
-
-  return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
-        시간별 점수 추세
-        {analysis.summary.improving && (
-          <span style={{ color: "var(--green-light)", fontSize: 10 }}>
-            ↑ +{(analysis.summary.delta * 100).toFixed(1)}%
-          </span>
-        )}
-      </div>
-      <ResponsiveContainer width="100%" height={80}>
-        <AreaChart data={data}>
-          <XAxis dataKey="name" tick={{ fontSize: 9, fill: "#999" }} axisLine={false} tickLine={false} />
-          <YAxis domain={[0, 100]} tick={{ fontSize: 9, fill: "#999" }} axisLine={false} tickLine={false} width={25} />
-          <Tooltip
-            contentStyle={{ background: "#1a2332", border: "1px solid #2a3a4a", borderRadius: 6, fontSize: 11 }}
-            formatter={(value: number, _: string, props: any) => [`${value}% (${props.payload.version}, ${props.payload.category})`, "Score"]}
-          />
-          <defs>
-            <linearGradient id="evalTrendGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#6aaf35" stopOpacity={0.3} />
-              <stop offset="100%" stopColor="#6aaf35" stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <Area type="monotone" dataKey="score" stroke="#6aaf35" fill="url(#evalTrendGrad)" strokeWidth={1.5} dot={false} />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
-function ToolCorrelationChart({ analysis }: { analysis: EvalAnalysis }) {
-  const data = Object.entries(analysis.tool_correlation)
-    .map(([tool, d]) => ({
-      name: tool.replace(/_/g, " "),
-      tool,
-      score: Math.round(d.avg_score_when_used * 100),
-      calls: d.call_count,
-      raw: d.avg_score_when_used,
-    }))
-    .sort((a, b) => b.score - a.score);
-
-  if (data.length === 0) return null;
-
-  return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 6 }}>사용된 Tool별 평가 점수</div>
-      <ResponsiveContainer width="100%" height={Math.max(80, data.length * 28)}>
-        <BarChart data={data} layout="vertical" barCategoryGap="25%" margin={{ left: 0, right: 8 }}>
-          <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 10, fill: "#999" }} axisLine={false} tickLine={false} />
-          <YAxis type="category" dataKey="name" tick={{ fontSize: 9, fill: "#bbb" }} axisLine={false} tickLine={false} width={100} />
-          <Tooltip
-            contentStyle={{ background: "#1a2332", border: "1px solid #2a3a4a", borderRadius: 6, fontSize: 11 }}
-            formatter={(value: number, _: string, props: any) => [`${value}% (${props.payload.calls}회 호출)`, "평균 점수"]}
-          />
-          <Bar dataKey="score" radius={[0, 3, 3, 0]}>
-            {data.map((entry, i) => <Cell key={i} fill={TOOL_COLORS[entry.tool] || "#6b7280"} />)}
-          </Bar>
-        </BarChart>
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
-// --- Deep Dive Tab ---
-
-function LowScoreRow({ turn, index }: { turn: any; index: number }) {
-  const [expanded, setExpanded] = useState(false);
-
-  return (
-    <div style={{ marginBottom: 8, border: "1px solid var(--navy-light)", borderRadius: "var(--radius)", overflow: "hidden" }}>
-      <div
-        onClick={() => setExpanded(!expanded)}
-        style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 10px", cursor: "pointer", background: "rgba(231, 76, 60, 0.05)" }}
-      >
-        {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-        <span style={{ fontSize: 11, color: "var(--gray-300)", width: 24 }}>#{index + 1}</span>
-        <span className={`eval-score ${scoreClass(turn.avg_score)}`} style={{ fontSize: 11 }}>
-          {(turn.avg_score * 100).toFixed(0)}%
-        </span>
-        <span style={{ fontSize: 10, padding: "1px 6px", borderRadius: 3, background: CATEGORY_COLORS[turn.category] || "#6b7280", color: "#fff", fontWeight: 500 }}>
-          {turn.category}
-        </span>
-        {turn.weakest_evaluator && (
-          <span style={{ fontSize: 10, color: "var(--red-light)", marginLeft: "auto" }}>
-            취약 항목: {turn.weakest_evaluator.replace("Builtin.", "")}
-          </span>
-        )}
-      </div>
-      {expanded && (
-        <div style={{ padding: "8px 10px", borderTop: "1px solid var(--navy-light)" }}>
-          <div style={{ fontSize: 10, color: "var(--gray-500)", marginBottom: 4 }}>프롬프트:</div>
-          <div style={{ fontSize: 11, color: "var(--gray-300)", marginBottom: 8, padding: "4px 8px", background: "var(--navy-light)", borderRadius: 4 }}>
-            {turn.prompt}
-          </div>
-          <div style={{ fontSize: 10, color: "var(--gray-500)", marginBottom: 4 }}>응답 (일부):</div>
-          <div style={{ fontSize: 11, color: "var(--gray-300)", marginBottom: 8, padding: "4px 8px", background: "var(--navy-light)", borderRadius: 4, maxHeight: 100, overflow: "auto" }}>
-            {turn.response}
-          </div>
-          {turn.tools_used.length > 0 && (
-            <div style={{ fontSize: 10, color: "var(--gray-500)", marginBottom: 6 }}>
-              사용된 Tool: {turn.tools_used.map((t: string) => (
-                <span key={t} style={{ padding: "1px 5px", borderRadius: 3, background: TOOL_COLORS[t] || "#6b7280", color: "#fff", marginRight: 4, fontSize: 9 }}>{t}</span>
-              ))}
-            </div>
-          )}
-          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: 8 }}>
-            {turn.scores.map((s: any) => (
-              <div key={s.evaluator}>
-                <div style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 10 }}>
-                  <span style={{ color: "var(--gray-400)" }}>{s.evaluator.replace("Builtin.", "")}</span>
-                  <span style={{ color: scoreBarColor(s.score), fontWeight: 600 }}>{(s.score * 100).toFixed(0)}%</span>
-                </div>
-                {s.explanation && (
-                  <div style={{ fontSize: 9, color: "var(--gray-500)", marginTop: 1, marginLeft: 4, lineHeight: 1.3 }}>
-                    {s.explanation}
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-          {turn.analysis && (
-            <div style={{ padding: "6px 8px", background: "rgba(255, 153, 0, 0.08)", border: "1px solid rgba(255, 153, 0, 0.2)", borderRadius: 4 }}>
-              <div style={{ fontSize: 10, fontWeight: 600, color: "var(--amber)", marginBottom: 4, display: "flex", alignItems: "center", gap: 4 }}>
-                <Lightbulb size={10} /> 점수가 낮은 이유
-              </div>
-              <div style={{ fontSize: 10, color: "var(--gray-300)", marginBottom: 4 }}>{turn.analysis.summary}</div>
-              {turn.analysis.recommendations.length > 0 && (
-                <div style={{ fontSize: 10, color: "var(--gray-400)" }}>
-                  {turn.analysis.recommendations.map((r: string, i: number) => (
-                    <div key={i} style={{ marginBottom: 2 }}>• {r}</div>
-                  ))}
-                </div>
+              {detail.results.length > 30 && (
+                <div className="eval-batch-detail__more">외 {detail.results.length - 30}건</div>
               )}
             </div>
           )}
         </div>
       )}
-    </div>
-  );
-}
-
-function HeatmapGrid({ analysis }: { analysis: EvalAnalysis }) {
-  const categories = Object.keys(analysis.by_category);
-  const evaluators = [...new Set(
-    Object.values(analysis.by_category).flatMap(c => Object.keys(c.evaluator_scores))
-  )].map(e => e.replace("Builtin.", ""));
-
-  const evaluatorsFull = [...new Set(
-    Object.values(analysis.by_category).flatMap(c => Object.keys(c.evaluator_scores))
-  )];
-
-  if (categories.length === 0 || evaluators.length === 0) return null;
-
-  return (
-    <div style={{ marginBottom: 16 }}>
-      <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 6 }}>평가기 × 카테고리 히트맵</div>
-      <div style={{ overflowX: "auto" }}>
-        <table style={{ fontSize: 10, borderCollapse: "collapse", width: "100%" }}>
-          <thead>
-            <tr>
-              <th style={{ textAlign: "left", padding: "3px 6px", color: "var(--gray-500)" }}></th>
-              {categories.map(c => (
-                <th key={c} style={{ textAlign: "center", padding: "3px 6px", color: CATEGORY_COLORS[c] || "var(--gray-400)", fontWeight: 500 }}>
-                  {c.charAt(0).toUpperCase() + c.slice(1)}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {evaluators.map((ev, i) => (
-              <tr key={ev}>
-                <td style={{ padding: "3px 6px", color: "var(--gray-400)", whiteSpace: "nowrap" }}>{ev}</td>
-                {categories.map(cat => {
-                  const score = analysis.by_category[cat]?.evaluator_scores[evaluatorsFull[i]] ?? null;
-                  if (score === null) return <td key={cat} style={{ textAlign: "center", padding: "3px 6px", color: "var(--gray-600)" }}>—</td>;
-                  const bg = score >= 0.8
-                    ? `rgba(106, 175, 53, ${score * 0.4})`
-                    : score >= 0.6
-                    ? `rgba(255, 153, 0, ${score * 0.3})`
-                    : `rgba(231, 76, 60, ${(1 - score) * 0.4})`;
-                  return (
-                    <td key={cat} style={{ textAlign: "center", padding: "3px 6px", background: bg, borderRadius: 2, color: "#fff", fontWeight: 500 }}>
-                      {(score * 100).toFixed(0)}%
-                    </td>
-                  );
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
+    </>
   );
 }
 
 // --- Main Component ---
 
-export default function EvalPanel({
-  evalHistory,
-  promptVersion,
-  onSwitchPrompt,
-  onRunEval,
-  isEvalRunning,
-  turnEvals,
-  turnEvalOrder,
-  improvementState,
-  onApplyImprovement,
-  onResetImprovement,
-  evalAnalysis,
-  compact,
-}: Props) {
-  const [subTab, setSubTab] = useState<SubTab>("overview");
+export default function EvalPanel({ compact }: Props) {
+  const [subTab, setSubTab] = useState<SubTab>("online");
+  const [evaluators, setEvaluators] = useState<Evaluator[]>([]);
+  const [configs, setConfigs] = useState<OnlineEvalConfig[]>([]);
+  const [batches, setBatches] = useState<BatchEvalSummary[]>([]);
+  const [showCreate, setShowCreate] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const latestEval = evalHistory[evalHistory.length - 1] || null;
-  const v1Evals = evalHistory.filter((e) => e.prompt_version === "v1");
-  const v2Evals = evalHistory.filter((e) => e.prompt_version === "v2");
-  const v3Evals = evalHistory.filter((e) => e.prompt_version === "v3");
-  const latestV1 = v1Evals[v1Evals.length - 1] || null;
-  const latestV2 = v2Evals[v2Evals.length - 1] || null;
-  const latestV3 = v3Evals[v3Evals.length - 1] || null;
-  const hasComparison = (latestV1 && latestV2) || (latestV2 && latestV3);
+  const loadData = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [evs, cfgs, bList] = await Promise.all([
+        api.getEvaluators(),
+        api.getOnlineConfigs(),
+        api.listBatchEvals(),
+      ]);
+      setEvaluators(evs.evaluators || evs || []);
+      setConfigs(cfgs.configs || cfgs || []);
+      setBatches(bList.batches || bList || []);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadData(); }, [loadData]);
+
+
+  const handleToggle = async (configId: string, enabled: boolean) => {
+    try {
+      await api.updateOnlineConfig(configId, { enabled });
+      loadData();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
+
+  const handleDelete = async (configId: string) => {
+    try {
+      await api.deleteOnlineConfig(configId);
+      loadData();
+    } catch (e: any) {
+      setError(e.message);
+    }
+  };
+
+  const hasInProgress = batches.some(b => b.status === "IN_PROGRESS" || b.status === "STARTING");
+
+  const handleStartBatch = async () => {
+    if (hasInProgress) {
+      setError("진행 중인 배치 평가가 있습니다. 완료 후 다시 시도하세요.");
+      return;
+    }
+    setBatchRunning(true);
+    setError(null);
+    try {
+      const evalIds = evaluators.filter(e => e.status === "ACTIVE").slice(0, 6).map(e => e.evaluator_id);
+      await api.startBatchEval({ name: `batch_${Date.now()}`, evaluator_ids: evalIds });
+      loadData();
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setBatchRunning(false);
+    }
+  };
+
+
+  const onlineCount = configs.length;
+  const batchCount = batches.length;
+  const evalCount = evaluators.length;
 
   return (
     <div className="panel">
       <div className="panel-header">
         <div className="panel-title">
           <Shield size={14} />
-          평가
-          {evalAnalysis?.custom_evaluator?.registered && (
-            <span style={{ fontSize: 9, padding: "1px 5px", borderRadius: 3, background: "rgba(139, 92, 246, 0.2)", color: "#8b5cf6", marginLeft: 6 }}>
-              +커스텀
-            </span>
-          )}
+          평가 (AgentCore Evaluation)
         </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 11, color: "var(--gray-500)" }}>
-            배치 {evalHistory.length}회 · 온라인 {turnEvalOrder.length}회
-          </span>
-        </div>
+        <button className="btn-icon" title="새로고침" onClick={loadData}>
+          <RefreshCw size={13} className={loading ? "spin" : ""} />
+        </button>
       </div>
 
-      {/* Sub-tab navigation */}
-      <div style={{ display: "flex", gap: 0, borderBottom: "1px solid var(--navy-light)", padding: "0 12px" }}>
-        {([["overview", "종합"], ["analysis", "분석"], ["deepdive", "심층 분석"]] as [SubTab, string][]).map(([key, label]) => (
-          <button
-            key={key}
-            onClick={() => setSubTab(key)}
-            style={{
-              padding: "6px 12px", fontSize: 11, fontWeight: subTab === key ? 600 : 400, cursor: "pointer",
-              background: "transparent", border: "none",
-              color: subTab === key ? "var(--green-light)" : "var(--gray-400)",
-              borderBottom: subTab === key ? "2px solid var(--green-light)" : "2px solid transparent",
-            }}
-          >
+      <div className="eval-tabs">
+        {([
+          ["online", "온라인 평가", onlineCount],
+          ["batch", "배치 평가", batchCount],
+          ["evaluators", "평가기", evalCount],
+        ] as [SubTab, string, number][]).map(([key, label, count]) => (
+          <button key={key} onClick={() => setSubTab(key)}
+            className={`eval-tabs__btn ${subTab === key ? "eval-tabs__btn--active" : ""}`}>
             {label}
+            {count > 0 && <span className="eval-tabs__badge">{count}</span>}
           </button>
         ))}
       </div>
 
       <div className="panel-body">
-        {/* ===== OVERVIEW TAB ===== */}
-        {subTab === "overview" && (
+        {error && <div className="eval-error" onClick={() => setError(null)}>{error}</div>}
+
+        {/* ===== ONLINE EVALUATION TAB ===== */}
+        {subTab === "online" && (
           <>
-            {/* Controls */}
             <div className="eval-controls">
-              <div className="eval-version-toggle">
-                {["v1", "v2", "v3"].map((v) => (
-                  <button
-                    key={v}
-                    className={`eval-version-btn ${promptVersion === v ? "active" : ""}`}
-                    onClick={() => onSwitchPrompt(v)}
-                  >
-                    {v.toUpperCase()} {v === "v1" ? "기본" : v === "v2" ? "개선" : "최적화"}
-                  </button>
-                ))}
-              </div>
-              <button className="btn btn-primary btn-sm" onClick={onRunEval} disabled={isEvalRunning}>
-                {isEvalRunning ? <Loader2 size={12} className="spin" /> : <PlayCircle size={12} />}
-                {isEvalRunning ? "실행 중…" : "평가 실행"}
+              <span className="eval-controls__version">
+                <Activity size={11} /> 실시간 자동 평가
+              </span>
+              <button className="btn btn-primary btn-sm" onClick={() => setShowCreate(true)}>
+                <Plus size={12} /> 설정 추가
               </button>
             </div>
-            {isEvalRunning && (
-              <div style={{ fontSize: 11, color: "var(--gray-500)", padding: "4px 0" }}>
-                CloudWatch에서 span을 가져와 평가기를 실행 중입니다…
+
+            {showCreate && (
+              <CreateConfigForm
+                evaluators={evaluators}
+                onClose={() => setShowCreate(false)}
+                onCreated={loadData}
+              />
+            )}
+
+            {configs.length === 0 && !showCreate ? (
+              <div className="empty-state" style={{ minHeight: compact ? 80 : 120 }}>
+                <Zap size={24} />
+                <p>온라인 평가 설정이 없습니다</p>
+                <p className="empty-hint">
+                  "설정 추가"를 눌러 AgentCore Online Evaluation Config를 생성하세요.<br/>
+                  에이전트 트래픽이 자동으로 샘플링되어 평가됩니다.
+                </p>
+              </div>
+            ) : (
+              <div className="eval-configs-list">
+                {configs.map(cfg => (
+                  <OnlineConfigCard
+                    key={cfg.config_id}
+                    config={cfg}
+                    onRefreshResults={() => {}}
+                    onToggle={handleToggle}
+                    onDelete={handleDelete}
+                  />
+                ))}
               </div>
             )}
 
-            <TurnTrendChart turnEvalOrder={turnEvalOrder} turnEvals={turnEvals} />
-            <ImprovementPipeline state={improvementState} onApply={onApplyImprovement} onReset={onResetImprovement} />
+          </>
+        )}
 
-            {!latestEval ? (
+        {/* ===== BATCH EVALUATION TAB ===== */}
+        {subTab === "batch" && (
+          <>
+            <div className="eval-controls">
+              <span className="eval-controls__version">
+                <List size={11} /> 대량 세션 일괄 평가
+              </span>
+              <button className="btn btn-primary btn-sm" onClick={handleStartBatch} disabled={batchRunning || hasInProgress}>
+                {batchRunning ? <Loader2 size={12} className="spin" /> : <PlayCircle size={12} />}
+                {hasInProgress ? "진행 중..." : "배치 실행"}
+              </button>
+            </div>
+
+            {batches.length === 0 ? (
               <div className="empty-state" style={{ minHeight: compact ? 80 : 100 }}>
                 <Shield size={24} />
-                <p>아직 배치 평가가 없습니다</p>
-                <p className="empty-hint">채팅 후에는 온라인 평가가 자동으로 실행됩니다</p>
-              </div>
-            ) : hasComparison && !compact ? (
-              <>
-                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, marginTop: 10 }}>
-                  <ArrowRightLeft size={14} style={{ color: "var(--amber)" }} />
-                  <span style={{ fontSize: 12, fontWeight: 600, color: "var(--gray-200)" }}>버전 비교</span>
-                </div>
-                <div className="eval-comparison">
-                  {latestV1 && (
-                    <div className="eval-version-col">
-                      <div className="eval-version-label v1">V1 기본</div>
-                      {latestV1.results.map((r) => <CompactScore key={r.evaluator} result={r} />)}
-                    </div>
-                  )}
-                  {latestV2 && (
-                    <div className="eval-version-col">
-                      <div className="eval-version-label v2">V2 개선</div>
-                      {latestV2.results.map((r) => <CompactScore key={r.evaluator} result={r} />)}
-                    </div>
-                  )}
-                  {latestV3 && (
-                    <div className="eval-version-col">
-                      <div className="eval-version-label v3">V3 최적화</div>
-                      {latestV3.results.map((r) => <CompactScore key={r.evaluator} result={r} />)}
-                    </div>
-                  )}
-                </div>
-                {latestV1 && latestV2 && (
-                  <div style={{ marginTop: 12, padding: "8px 12px", background: "rgba(106, 175, 53, 0.1)", border: "1px solid rgba(106, 175, 53, 0.3)", borderRadius: "var(--radius)" }}>
-                    <div style={{ fontSize: 11, fontWeight: 600, color: "var(--green-light)", marginBottom: 4 }}>개선 요약</div>
-                    {latestV1.results.map((v1r) => {
-                      const latest = latestV3 || latestV2;
-                      const cmp = latest!.results.find((r) => r.evaluator === v1r.evaluator);
-                      if (!cmp) return null;
-                      const delta = cmp.score - v1r.score;
-                      return (
-                        <div key={v1r.evaluator} style={{ fontSize: 11, color: "var(--gray-300)", display: "flex", gap: 8 }}>
-                          <span style={{ flex: 1 }}>{v1r.evaluator.replace("Builtin.", "")}</span>
-                          <span style={{ color: delta > 0 ? "var(--green-light)" : "var(--red-light)" }}>
-                            {delta > 0 ? "+" : ""}{(delta * 100).toFixed(1)}%
-                          </span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </>
-            ) : (
-              <div className="eval-results">
-                <div style={{ fontSize: 11, color: "var(--gray-500)", marginBottom: 4 }}>
-                  {latestEval.prompt_version.toUpperCase()} — {new Date(latestEval.timestamp).toLocaleTimeString()}
-                </div>
-                {latestEval.results.map((r) => <EvalResultRow key={r.evaluator} result={r} />)}
-              </div>
-            )}
-          </>
-        )}
-
-        {/* ===== ANALYSIS TAB ===== */}
-        {subTab === "analysis" && (
-          <>
-            {!evalAnalysis || evalAnalysis.summary.total_turns === 0 ? (
-              <div className="empty-state" style={{ minHeight: 100 }}>
-                <TrendingUp size={24} />
-                <p>분석할 데이터가 없습니다</p>
-                <p className="empty-hint">채팅 메시지를 보내면 매 턴마다 온라인 평가가 실행됩니다</p>
+                <p>배치 평가 내역이 없습니다</p>
+                <p className="empty-hint">"배치 실행"으로 CloudWatch 로그의 세션을 일괄 평가합니다</p>
               </div>
             ) : (
-              <>
-                {/* Summary banner */}
-                <div style={{ display: "flex", gap: 12, marginBottom: 14 }}>
-                  <div style={{ flex: 1, padding: "6px 10px", background: "var(--navy-light)", borderRadius: "var(--radius)", textAlign: "center" }}>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: evalAnalysis.summary.improving ? "var(--green-light)" : "var(--amber)" }}>
-                      {evalAnalysis.summary.total_turns}
-                    </div>
-                    <div style={{ fontSize: 9, color: "var(--gray-500)" }}>평가된 턴 수</div>
-                  </div>
-                  <div style={{ flex: 1, padding: "6px 10px", background: "var(--navy-light)", borderRadius: "var(--radius)", textAlign: "center" }}>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: evalAnalysis.summary.improving ? "var(--green-light)" : "var(--gray-300)" }}>
-                      {evalAnalysis.summary.improving ? "↑" : "→"}
-                    </div>
-                    <div style={{ fontSize: 9, color: "var(--gray-500)" }}>
-                      {evalAnalysis.summary.improving ? `상승 중 (+${(evalAnalysis.summary.delta * 100).toFixed(1)}%)` : "안정적"}
-                    </div>
-                  </div>
-                  <div style={{ flex: 1, padding: "6px 10px", background: "var(--navy-light)", borderRadius: "var(--radius)", textAlign: "center" }}>
-                    <div style={{ fontSize: 18, fontWeight: 700, color: "var(--gray-300)" }}>
-                      {Object.keys(analysis_categories(evalAnalysis)).length}
-                    </div>
-                    <div style={{ fontSize: 9, color: "var(--gray-500)" }}>카테고리 수</div>
-                  </div>
-                </div>
-
-                <CategoryScoreChart analysis={evalAnalysis} />
-                <EvaluatorLeaderboard analysis={evalAnalysis} />
-                <TimeTrendChart analysis={evalAnalysis} />
-                <ToolCorrelationChart analysis={evalAnalysis} />
-
-                {/* Turn-by-Turn Results */}
-                {turnEvalOrder.length > 0 && (
-                  <div style={{ marginTop: 16 }}>
-                    <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                      <Search size={12} />
-                      턴별 결과 ({turnEvalOrder.length}개)
-                    </div>
-                    {turnEvalOrder.map((tid, i) => {
-                      const ev = turnEvals[tid];
-                      if (!ev) return null;
-                      return <TurnDetailRow key={tid} turn={ev} index={i} />;
-                    })}
-                  </div>
-                )}
-              </>
-            )}
-          </>
-        )}
-
-        {/* ===== DEEP DIVE TAB ===== */}
-        {subTab === "deepdive" && (
-          <>
-            {!evalAnalysis || evalAnalysis.low_score_turns.length === 0 ? (
-              <div className="empty-state" style={{ minHeight: 100 }}>
-                <AlertTriangle size={24} />
-                <p>저점수 턴이 아직 없습니다</p>
-                <p className="empty-hint">65% 미만 턴이 분석과 함께 여기 표시됩니다</p>
-              </div>
-            ) : (
-              <>
-                <div style={{ fontSize: 11, color: "var(--gray-400)", marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                  <AlertTriangle size={12} style={{ color: "var(--red-light)" }} />
-                  저점수 턴 {evalAnalysis.low_score_turns.length}개 (65% 미만)
-                </div>
-
-                {evalAnalysis.low_score_turns.map((turn, i) => (
-                  <LowScoreRow key={turn.turn_id} turn={turn} index={i} />
+              <div className="eval-batch-list">
+                {batches.map(b => (
+                  <BatchCard key={b.batch_id} batch={b} onViewDetail={() => {}} />
                 ))}
+              </div>
+            )}
+          </>
+        )}
 
-                <HeatmapGrid analysis={evalAnalysis} />
-              </>
+        {/* ===== EVALUATORS TAB ===== */}
+        {subTab === "evaluators" && (
+          <>
+            <div className="eval-controls">
+              <span className="eval-controls__version">
+                <CheckCircle2 size={11} /> AgentCore 내장 평가기
+              </span>
+            </div>
+
+            {evaluators.length === 0 ? (
+              <div className="empty-state" style={{ minHeight: 80 }}>
+                <Loader2 size={20} className="spin" />
+                <p>평가기 목록 로딩 중...</p>
+              </div>
+            ) : (
+              <div className="eval-evaluators-list">
+                {evaluators.map(ev => (
+                  <div key={ev.evaluator_id} className="eval-evaluator-card">
+                    <div className="eval-evaluator-card__header">
+                      <span className="eval-evaluator-card__name">{ev.name.replace("Builtin.", "")}</span>
+                      <StatusBadge status={ev.status} />
+                      <span className="badge badge--info">{ev.type}</span>
+                    </div>
+                    <div className="eval-evaluator-card__desc">{ev.description}</div>
+                    <div className="divider" />
+                    <div className="eval-evaluator-card__meta">
+                      <span className="badge badge--neutral"><Layers size={9} /> {ev.level}</span>
+                      <span className="badge badge--neutral badge--mono">{ev.evaluator_id}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
             )}
           </>
         )}
       </div>
-    </div>
-  );
-}
-
-function analysis_categories(a: EvalAnalysis): Record<string, any> {
-  return a.by_category;
-}
-
-function CompactScore({ result }: { result: EvalResult }) {
-  return (
-    <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
-      <span style={{ fontSize: 11, color: "var(--gray-400)", flex: 1 }}>
-        {result.evaluator.replace("Builtin.", "")}
-      </span>
-      <div style={{ width: 60, height: 4, background: "var(--navy-light)", borderRadius: 2, overflow: "hidden" }}>
-        <div style={{ width: `${result.score * 100}%`, height: "100%", background: scoreColor(result.score), borderRadius: 2 }} />
-      </div>
-      <span className={`eval-score ${scoreClass(result.score)}`} style={{ fontSize: 12, minWidth: 42, textAlign: "right" }}>
-        {(result.score * 100).toFixed(0)}%
-      </span>
     </div>
   );
 }
