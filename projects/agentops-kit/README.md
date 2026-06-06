@@ -113,6 +113,8 @@ The dashboard surfaces every stage of the pipeline. Click any thumbnail to open 
 
 ## Architecture
 
+![architecture](./assets/architecture.png)
+
 ### AWS Services
 
 ```mermaid
@@ -216,55 +218,6 @@ flowchart TB
     class BR,BRG models
     class CB,ECR cicd
     class ADOT,CWGen,CW tele
-```
-
-### Data Plane — request path
-
-```mermaid
-flowchart LR
-    User([User])
-    UI["React Dashboard<br/>:3000"]
-    BFF["FastAPI BFF<br/>:8000"]
-    Cognito[("Cognito")]
-
-    subgraph Runtimes ["AgentCore Runtime — main + 2 specialists"]
-        direction LR
-        Main["main"]
-        Reviews["reviews"]
-        Logistics["logistics"]
-        Main -.A2A.-> Reviews
-        Main -.A2A.-> Logistics
-    end
-
-    LLMGW["LLM Gateway"]
-    BRGuard["Bedrock Guardrails"]
-    Bedrock[("Bedrock<br/>Claude · Nova")]
-
-    Gateway["AgentCore Gateway"]
-    Lambda["tool-router Lambda"]
-    Aurora[("Aurora PG")]
-
-    User --> UI --> BFF --> Runtimes
-    Cognito -. JWT .- UI
-    Cognito -. JWT .- BFF
-    Cognito -. OAuth .- Gateway
-
-    Runtimes --> LLMGW --> BRGuard --> Bedrock
-    Runtimes -- MCP --> Gateway --> Lambda --> Aurora
-
-    classDef user   fill:#fff,stroke:#57606a,color:#24292f
-    classDef edge   fill:#fff4d6,stroke:#b8860b,color:#5b3b00
-    classDef app    fill:#e8f1ff,stroke:#1f6feb,color:#0b3a85
-    classDef ac     fill:#ede7ff,stroke:#7d4dff,color:#3b1f8a
-    classDef tool   fill:#e8f7ee,stroke:#2da44e,color:#0b5d2c
-    classDef model  fill:#ffeaea,stroke:#cf222e,color:#7a1018
-
-    class User user
-    class UI,Cognito edge
-    class BFF app
-    class Main,Reviews,Logistics,LLMGW,Gateway ac
-    class Lambda,Aurora tool
-    class BRGuard,Bedrock model
 ```
 
 ### AgentOps Plane — observe → evaluate → optimize → apply
