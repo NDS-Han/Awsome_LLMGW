@@ -4,7 +4,7 @@ pytest.importorskip("rich")
 
 from pathlib import Path
 
-from deployment.tui import cli
+from deployment.tui import cli, postdeploy as pd
 from deployment.tui.preflight import CheckResult
 from deployment.tui.steps import Step
 
@@ -191,3 +191,98 @@ def test_flow_all_returns_false_when_tool_fails(monkeypatch):
     monkeypatch.setattr(cli, "flow_tool", lambda: calls.append("tool") or False)
     assert cli.flow_all() is False
     assert calls == ["llm", "tool"]
+
+
+def test_render_endpoints_panel_shows_urls(capsys):
+    eps = pd.Endpoints(items=[
+        pd.Endpoint("admin-ui", "llm-gateway-admin-ui", "u.elb.amazonaws.com"),
+    ])
+    cli.render_endpoints_panel(eps)
+    out = capsys.readouterr().out
+    assert "u.elb.amazonaws.com" in out
+
+
+def test_render_endpoints_panel_pending_message_when_empty(capsys):
+    cli.render_endpoints_panel(pd.Endpoints(items=[]))
+    out = capsys.readouterr().out
+    assert "프로비저닝" in out or "준비" in out
+
+
+def test_render_next_steps_includes_doc_path(capsys):
+    cli.render_next_steps("dev")
+    out = capsys.readouterr().out
+    assert "08-post-deploy-tui.md" in out
+    assert "KUBECONFIG" in out
+
+
+def test_render_health_table_renders_all_states(capsys):
+    results = [
+        pd.HealthResult("pods", "ok", "6/6 Ready"),
+        pd.HealthResult("gateway", "pending", "연결 안 됨"),
+        pd.HealthResult("admin-ui", "check", "HTTP 500"),
+    ]
+    cli.render_health_table(results)
+    out = capsys.readouterr().out
+    assert "pods" in out and "gateway" in out and "admin-ui" in out
+
+
+def test_show_postdeploy_summary_calls_discover_and_renders(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli.postdeploy, "discover_endpoints",
+                        lambda **k: calls.append("discover") or pd.Endpoints(items=[]))
+    monkeypatch.setattr(cli, "render_endpoints_panel", lambda e: calls.append("panel"))
+    monkeypatch.setattr(cli, "render_next_steps", lambda env: calls.append(f"steps:{env}"))
+    cli._show_postdeploy_summary("dev")
+    assert calls == ["discover", "panel", "steps:dev"]
+
+
+def test_show_postdeploy_summary_swallows_errors(monkeypatch):
+    # discover 가 터져도 배포 성공 흐름을 깨면 안 된다
+    def boom(**k):
+        raise RuntimeError("kubectl exploded")
+    monkeypatch.setattr(cli.postdeploy, "discover_endpoints", boom)
+    monkeypatch.setattr(cli, "render_next_steps", lambda env: None)
+    cli._show_postdeploy_summary("dev")  # 예외 없이 반환
+
+
+def test_flow_llm_shows_summary_on_success(monkeypatch):
+    # flow_llm 이 배포 성공(run_and_report True) 후 summary 를 부르는지
+    seen = []
+    monkeypatch.setattr(cli, "_show_postdeploy_summary", lambda env: seen.append(env))
+    cli._maybe_postdeploy(True, "dev")
+    assert seen == ["dev"]
+    seen.clear()
+    cli._maybe_postdeploy(False, "dev")  # 실패면 호출 안 함
+    assert seen == []
+
+
+def test_menu_includes_verify():
+    labels = [label for label, _ in cli.MENU]
+    handlers = [h for _, h in cli.MENU]
+    assert "배포 검증 (Health Check)" in labels
+    assert cli.flow_verify in handlers
+
+
+def test_flow_verify_runs_discover_health_and_smoke(monkeypatch):
+    order = []
+    monkeypatch.setattr(cli, "run_preflight", lambda tools: True)
+    monkeypatch.setattr(cli, "ask_select", lambda msg, choices: "dev")
+    monkeypatch.setattr(cli.postdeploy, "discover_endpoints",
+                        lambda **k: order.append("discover") or pd.Endpoints(items=[]))
+    monkeypatch.setattr(cli, "render_endpoints_panel", lambda e: order.append("panel"))
+    monkeypatch.setattr(cli.postdeploy, "live_healthcheck",
+                        lambda eps, **k: order.append("health") or [])
+    monkeypatch.setattr(cli, "render_health_table", lambda r: order.append("htable"))
+    monkeypatch.setattr(cli, "run_and_report",
+                        lambda wf, title: order.append("smoke") or True)
+    monkeypatch.setattr(cli, "render_next_steps", lambda env: order.append("steps"))
+    assert cli.flow_verify() is True
+    assert order == ["discover", "panel", "health", "htable", "smoke", "steps"]
+
+
+def test_flow_verify_aborts_on_preflight_fail(monkeypatch):
+    monkeypatch.setattr(cli, "run_preflight", lambda tools: False)
+    ran = []
+    monkeypatch.setattr(cli, "run_and_report", lambda wf, title: ran.append(title) or True)
+    assert cli.flow_verify() is False
+    assert ran == []

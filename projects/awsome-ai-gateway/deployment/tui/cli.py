@@ -14,9 +14,10 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from . import config, paths, preflight
+from . import config, paths, postdeploy, preflight
 from .config import BackendConfig
 from .steps import (
+    Step,
     build_llm_teardown,
     build_llm_workflow,
     build_tool_teardown,
@@ -76,6 +77,60 @@ ENGINES = [
     ("you", "enable_you", True),
 ]
 
+# 다음 단계 가이드에서 가리키는 리포 내 문서 경로(실제 위치라 상수).
+NEXT_STEPS_DOCS = {
+    "post_deploy": "deployment/docs/eks-fargate/08-post-deploy-tui.md",
+    "cognito": "deployment/docs/eks-fargate/07-cognito-onboarding.md",
+}
+
+_STATE_MARK = {
+    "ok": "[green]✓[/green]",
+    "pending": "[yellow]⏳[/yellow]",
+    "check": "[yellow]⚠[/yellow]",
+}
+
+
+def render_endpoints_panel(endpoints) -> None:
+    """엔드포인트 3개 URL 을 표로. 비어있으면 프로비저닝 안내."""
+    if endpoints.error:
+        console.print(f"[yellow]엔드포인트 조회 실패[/yellow] — {endpoints.error}")
+        console.print("[dim]KUBECONFIG 를 격리 파일로 맞췄는지 확인하세요.[/dim]")
+        return
+    if not endpoints.items or all(e.hostname is None for e in endpoints.items):
+        console.print(
+            "[yellow]ALB 프로비저닝 중[/yellow] — hostname 이 아직 없습니다.\n"
+            "[dim]1~2분 뒤 메뉴 → '배포 검증'에서 다시 확인하세요.[/dim]"
+        )
+        return
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("서비스")
+    table.add_column("URL", style="cyan")
+    for ep in endpoints.items:
+        table.add_row(ep.role, ep.url or "[dim]프로비저닝 중[/dim]")
+    console.print(Panel(table, title="접속 엔드포인트", border_style="cyan"))
+
+
+def render_next_steps(env: str) -> None:
+    """핵심 액션 + 문서 링크. 복붙 명령어 나열은 하지 않는다."""
+    body = Text()
+    body.append("다음 단계:\n", style="bold")
+    body.append("  1. kubectl 컨텍스트: export KUBECONFIG=/tmp/llm-gateway.kubeconfig\n")
+    body.append("  2. 준비되면(1~2분) 메뉴 → '배포 검증'으로 Pod/엔드포인트 헬스체크\n")
+    body.append("  3. Admin UI 접속 → Cognito admin 온보딩 (첫 사용자 + 팀 그룹)\n")
+    body.append("  4. 팀 budget 활성화 (기본 $0 + HARD_BLOCK → 활성화 전 모든 요청 429, 버그 아님)\n")
+    console.print(Panel(body, title=f"배포 후 가이드 ({env})", border_style="green"))
+    console.print(f"[dim]상세 가이드: {NEXT_STEPS_DOCS['post_deploy']}[/dim]")
+    console.print(f"[dim]Cognito 온보딩: {NEXT_STEPS_DOCS['cognito']}[/dim]")
+
+
+def render_health_table(results) -> None:
+    table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
+    table.add_column("항목")
+    table.add_column("상태")
+    table.add_column("detail", style="dim")
+    for r in results:
+        table.add_row(r.label, _STATE_MARK.get(r.state, r.state), r.detail)
+    console.print(table)
 
 # --------------------------------------------------------------------------- #
 # 표시 헬퍼
@@ -191,6 +246,25 @@ def run_and_report(wf, title: str) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Post-deploy 훅 — 배포 직후 엔드포인트 조회 + 가이드 (curl 없음)
+# --------------------------------------------------------------------------- #
+def _show_postdeploy_summary(env: str, cluster_name: str = "llm-gateway") -> None:
+    """배포 직후: 엔드포인트 조회(curl 없음) + 다음 단계 가이드. 검증은 부수기능이라
+    어떤 실패도 배포 성공 메시지를 덮지 않도록 예외를 삼킨다."""
+    try:
+        eps = postdeploy.discover_endpoints(cluster_name=cluster_name)
+        render_endpoints_panel(eps)
+    except Exception as exc:  # noqa: BLE001 - 배포 성공 흐름 보호가 우선
+        console.print(f"[dim]엔드포인트 조회 건너뜀: {exc}[/dim]")
+    render_next_steps(env)
+
+
+def _maybe_postdeploy(deploy_ok: bool, env: str) -> None:
+    if deploy_ok:
+        _show_postdeploy_summary(env)
+
+
+# --------------------------------------------------------------------------- #
 # 워크플로우 A — LLM Gateway
 # --------------------------------------------------------------------------- #
 def flow_llm() -> bool:
@@ -284,7 +358,9 @@ def flow_llm() -> bool:
     if not ask_confirm("위 스텝을 실행합니다 (실제 배포) — 계속?", default=False):
         console.print("[dim]취소됨[/dim]")
         return False
-    return run_and_report(wf, f"LLM Gateway {env}")
+    ok = run_and_report(wf, f"LLM Gateway {env}")
+    _maybe_postdeploy(ok, env)
+    return ok
 
 
 # --------------------------------------------------------------------------- #
@@ -394,7 +470,37 @@ def _preview_steps(wf) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 워크플로우 C — 스택 삭제 (Teardown)
+# 워크플로우 D — 배포 검증 (Health Check)
+# --------------------------------------------------------------------------- #
+def flow_verify() -> bool:
+    """배포 검증: 엔드포인트 조회 + 라이브 헬스체크 + smoke-test.sh. 읽기 전용이라
+    파괴적 작업 아님. 배포가 이미 끝난 뒤 1~2분 지나 실행하는 용도."""
+    console.rule("[bold]배포 검증 (Health Check)[/bold]")
+    if not run_preflight(preflight.LLM_TOOLS):
+        console.print("[red]사전검증 실패[/red] — 누락 도구/인증을 해결하세요.")
+        return False
+    env = ask_select("환경", ["dev", "prod"])
+
+    eps = postdeploy.discover_endpoints()
+    render_endpoints_panel(eps)
+
+    console.rule("[bold]라이브 헬스체크[/bold]")
+    render_health_table(postdeploy.live_healthcheck(eps))
+
+    # smoke-test.sh 는 격리 KUBECONFIG 로. skippable — ALB 미준비 시 실패해도 검증 흐름 유지.
+    kubeconfig = postdeploy.isolated_kubeconfig()
+    smoke = [Step("smoke-test",
+                  ["bash", str(paths.script("smoke-test.sh")), "--env", env],
+                  env={"KUBECONFIG": kubeconfig},
+                  skippable=True)]
+    ok = run_and_report(smoke, f"smoke-test {env}")
+
+    render_next_steps(env)
+    return ok
+
+
+# --------------------------------------------------------------------------- #
+# 워크플로우 E — 스택 삭제 (Teardown)
 # --------------------------------------------------------------------------- #
 def flow_teardown() -> bool:
     """배포된 스택 삭제. 파괴적 작업이라 대상 요약 + 이중 확인(타이핑) 필수."""
@@ -462,6 +568,7 @@ MENU = [
     ("LLM Gateway 배포", flow_llm),
     ("Tool Gateway 배포", flow_tool),
     ("전체 배포 (LLM → Tool)", flow_all),
+    ("배포 검증 (Health Check)", flow_verify),
     ("스택 삭제 (Teardown)", flow_teardown),
 ]
 
