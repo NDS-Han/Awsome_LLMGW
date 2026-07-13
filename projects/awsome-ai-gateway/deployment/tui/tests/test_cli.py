@@ -76,8 +76,8 @@ def test_aws_account_id_none_when_cli_missing(monkeypatch):
 
 def test_llm_tfstate_defaults_includes_account_suffix():
     # 버킷은 S3 전역 유일성 때문에 계정 접미 필수, 락테이블은 접미 없음
-    bucket, table = cli.llm_tfstate_defaults("913524902871")
-    assert bucket == "llm-gateway-vanilla-tfstate-913524902871"
+    bucket, table = cli.llm_tfstate_defaults("123456789012")
+    assert bucket == "llm-gateway-vanilla-tfstate-123456789012"
     assert table == "llm-gateway-vanilla-tflock"
 
 
