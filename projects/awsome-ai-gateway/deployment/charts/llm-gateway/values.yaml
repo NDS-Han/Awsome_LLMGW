@@ -3,14 +3,14 @@
 # ============================================================================
 # LLM Gateway — Helm Chart 공통 기본값
 # ----------------------------------------------------------------------------
-# 이 파일은 모든 환경(EKS Fargate dev/prod, on-prem dev/prod)이 상속하는
+# 이 파일은 모든 환경(EKS Fargate dev/prod)이 상속하는
 # 공통 기본값을 정의합니다. 환경별 차이는 values-{env}.yaml 에서 오버라이드합니다.
 #
 # 설계 원칙:
 #   1. stateful(Postgres/Redis)은 기본 off — 외부 관리형(Aurora/ElastiCache 등) 사용
 #   2. 모든 서비스는 resource limit/request + probe + SecurityContext 필수
 #   3. Secret 주입은 두 가지 모드 지원: Helm Secret vs ExternalSecrets Operator
-#   4. IRSA annotation은 EKS 배포에서만 적용 (on-prem은 빈 값)
+#   4. IRSA annotation은 EKS 배포에서 적용
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -35,8 +35,8 @@ global:
   # 배포 환경 플래그 (dev | staging | prod) — app에 APP_ENV 로 주입
   environment: dev
 
-  # 배포 모드 (eks-fargate | onprem) — 조건부 리소스 분기에 사용
-  deploymentMode: onprem
+  # 배포 모드 (eks-fargate) — 조건부 리소스 분기에 사용
+  deploymentMode: eks-fargate
 
 # ----------------------------------------------------------------------------
 # Name overrides
@@ -51,7 +51,7 @@ serviceAccount:
   # chart 공통 SA 생성 여부. 서비스별 SA는 서비스 섹션 내 serviceAccount에서 별도 제어.
   create: true
   name: ""
-  # EKS Fargate에서 IRSA 쓸 때 주입. on-prem에선 빈 객체.
+  # EKS Fargate에서 IRSA 쓸 때 주입. EKS 외 환경에선 빈 객체.
   annotations: {}
   # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/llm-gateway-common
   automountServiceAccountToken: true
@@ -204,14 +204,14 @@ auth:
     extraKeysEnabled: false
 
 # ----------------------------------------------------------------------------
-# Ingress (ALB on EKS / nginx on on-prem)
+# Ingress (ALB on EKS)
 # ----------------------------------------------------------------------------
 ingress:
   enabled: true
-  # "alb" (EKS Fargate) | "nginx" (on-prem)
+  # "alb" (EKS Fargate)
   className: "nginx"
 
-  # ALB(EKS) 또는 nginx(on-prem) 공통 어노테이션
+  # ALB(EKS) 어노테이션
   annotations: {}
 
   # gateway-proxy (사용자 API, data-plane)
@@ -399,7 +399,7 @@ gatewayProxy:
     # Fargate cpu request 기준 워커당 CPU 기아를 피하도록 설정(0.5 vCPU=2, 0.25 vCPU=1~2).
     # ⚠️ 1.0.98 이전 이미지는 CMD 가 --workers 4 하드코딩이라 이 값이 무시됐음(죽은 설정).
     WORKERS: "2"
-    OPENMODEL_BASE_URL: ""  # 사내 vLLM 엔드포인트. on-prem만 사용
+    OPENMODEL_BASE_URL: ""  # 사내 vLLM 엔드포인트. 미사용
     # Redis 스트림 / 예산 관련
     COST_STREAM_KEY: "cost:stream"
     BUDGET_DEFAULT_POLICY: "HARD_BLOCK"
@@ -498,7 +498,7 @@ adminApi:
   # 채우면 dual-mode (STS + OIDC).
   #
   # EKS Fargate 환경에서는 install-eks.sh 가 terraform output (cognito_*) 을
-  # 자동으로 주입. on-prem/dev override 는 values-{env}.yaml 에서.
+  # 자동으로 주입. dev override 는 values-{env}.yaml 에서.
   oidc:
     enabled: false  # values-eks-fargate-{dev,prod}.yaml 에서 true 로 override
     issuerUrl: ""              # OIDC_ISSUER_URL — Cognito issuer URL

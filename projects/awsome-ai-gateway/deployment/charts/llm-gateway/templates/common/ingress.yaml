@@ -4,7 +4,7 @@
 {{/*
 Gateway(사용자 API), Admin UI(웹), Admin API(REST) 를 각각 별도 Ingress 리소스로 생성.
 - 서로 다른 hostname 사용 → 보안 분리 (data-plane vs control-plane)
-- ALB(EKS) / nginx(on-prem) 공통 이 템플릿으로 커버
+- ALB(EKS) Ingress 템플릿
 */}}
 
 # ----------------------------------------------------------------------------

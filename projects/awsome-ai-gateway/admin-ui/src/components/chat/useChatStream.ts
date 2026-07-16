@@ -34,10 +34,10 @@ export function useChatStream({ onEvent, onError }: ChatStreamOptions) {
       setIsStreaming(true);
 
       try {
-        // screen_context: "지금 보는 화면" 요약(있을 때만). agent 가 컨텍스트
-        // 질의에 활용. 없으면 기존과 동일한 {content} 전송.
         const payload: Record<string, unknown> = { content, mode };
         if (screenContext) payload.screen_context = screenContext;
+        const localeCookie = document.cookie.match(/(?:^|; )locale=([^;]*)/);
+        payload.language = localeCookie?.[1] === 'en' ? 'en' : 'ko';
         const response = await fetch(
           `${API_BASE}/admin/chat/sessions/${sessionId}/messages`,
           {

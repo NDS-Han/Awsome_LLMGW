@@ -313,6 +313,8 @@ class MessageCreate(BaseModel):
     # 모드(§55): "quick"(퀵챗 드로어 — 즉답) | "deep"(사이드바 Chat — plan-first
     # 심층분석). agent 가 orchestrator 프로필을 선택한다. 기본 quick(하위호환).
     mode: Literal["quick", "deep"] = "quick"
+    # UI 언어 (한/영 토글). agent 가 이 언어로 응답을 생성하도록 payload 에 포함.
+    language: Literal["ko", "en"] = "ko"
 
 
 @router.post("/sessions/{session_id}/messages")
@@ -363,7 +365,7 @@ async def post_message(
     _active_relays[session_id] = relay
     asyncio.get_running_loop().create_task(
         _agentcore_producer(
-            relay, session_id, req.content, req.screen_context, req.mode
+            relay, session_id, req.content, req.screen_context, req.mode, req.language
         )
     )
 
@@ -442,6 +444,7 @@ async def _agentcore_producer(
     content: str,
     screen_context: dict | None = None,
     mode: str = "quick",
+    language: str = "ko",
 ) -> None:
     """AgentCore InvokeAgentRuntime → 릴레이 발행 + DB 영속화 (background, §56).
 
@@ -457,7 +460,7 @@ async def _agentcore_producer(
     import boto3
     from botocore.config import Config as BotoConfig
 
-    payload = {"content": content, "session_id": session_id, "mode": mode}
+    payload = {"content": content, "session_id": session_id, "mode": mode, "language": language}
     if screen_context:
         payload["screen_context"] = screen_context
 

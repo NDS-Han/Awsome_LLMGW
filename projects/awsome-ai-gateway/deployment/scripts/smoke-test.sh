@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --namespace|-n) NAMESPACE="$2"; shift 2 ;;
         --env)          shift 2 ;;  # 외부에서만 쓰는 인자
-        --onprem)       shift ;;
+        
         --with-bedrock) WITH_BEDROCK=1; shift ;;
         *) echo "Unknown flag: $1"; exit 1 ;;
     esac
