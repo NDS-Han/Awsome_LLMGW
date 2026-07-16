@@ -48,16 +48,17 @@ export default async function RootLayout({
   }
 
   const messages = await getMessages();
+  const locale = cookieStore.get('locale')?.value || 'ko';
 
   return (
     <html
-      lang="ko"
+      lang={locale}
       suppressHydrationWarning
       className={`${pretendard.variable} ${GeistMono.variable}`}
     >
       <body>
         <ThemeProvider>
-          <NextIntlClientProvider messages={messages} locale="ko">
+          <NextIntlClientProvider messages={messages} locale={locale}>
             <ToastProvider>
               <div className="flex h-screen bg-background">
                 <Sidebar role={session?.role} />
