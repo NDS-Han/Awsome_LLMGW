@@ -126,7 +126,7 @@ async function DashboardKPIs({ period, client }: { period: string; client: strin
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-4">
           <KPICard
             title="이번 달 사용량"
-            value={fmtUsd2(totalUsageUsd)}
+            value={fmtUsd2(summary.total_cost_usd ?? totalUsageUsd)}
             icon={<DollarSign size={18} aria-hidden="true" />}
             description="USD 기준 당월 누적 비용"
           />

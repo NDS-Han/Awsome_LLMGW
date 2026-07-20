@@ -66,6 +66,47 @@ Zero client-side configuration.
 
 ---
 
+## Advantages over Other Open-Source LLM Proxies
+
+### Security Architecture: Re-origination vs Relay
+
+Typical open-source LLM proxies **relay** client requests to upstream. Even with header manipulation or filtering, the fundamental approach is "pass through and selectively block" — a single configuration gap can leak credentials.
+
+AWSome AI Gateway uses **re-origination**. Inbound requests are deconstructed; only explicitly allowed fields are extracted; a new request is built from scratch with the gateway's own credentials (IRSA/SigV4/broker). Client keys (VK) never reach the upstream model. Upstream headers never reach the client. There is no configuration that weakens this boundary — security is structural.
+
+### Token Usage Accuracy
+
+| Aspect | Other Open-Source | AWSome AI Gateway |
+|--------|------------------|-------------------|
+| Primary accounting | Provider usage field (same) | Provider usage field (same) |
+| When usage field is incomplete/missing | Local tiktoken approximation (significant error on Claude models) | **Bedrock invocationMetrics** as billable ground truth + **Bedrock CountTokens API** for estimation → aligns with AWS billing |
+
+### Cost Preservation on Stream Interruption
+
+| Aspect | Other Open-Source | AWSome AI Gateway |
+|--------|------------------|-------------------|
+| When cost is recorded | Only on natural stream completion (all-or-nothing) | Text accumulated during stream + partial cost recorded on interruption |
+| Result of mid-stream disconnect | Tokens already consumed are recorded as **$0** (cost logic is skipped entirely) | Text up to the break point is measured via CountTokens API → **partial cost preserved** |
+
+→ "Inaccuracy" and "loss" are different problems. Other proxies may inaccurately record completed streams, but mid-stream interruptions record nothing at all. We handle both cases with precise Bedrock token counts.
+
+### Cost Recording Worker Fault Tolerance
+
+| Aspect | Other Open-Source | AWSome AI Gateway |
+|--------|------------------|-------------------|
+| Architecture | Single leader flushes to DB (Redis-lock-based leader election) | **Redis Stream Consumer Group** — leaderless, multiple workers consume in parallel |
+| On leader failure | Cost recording stalls for lock TTL duration (single point of failure) | Remaining pods continue consuming immediately (no single point of failure) |
+| Deadlock prevention | Redis lock blocks concurrent writes | Redis distributes messages without overlap — no locks needed |
+
+### Cascade Failure Prevention
+
+| Aspect | Other Open-Source | AWSome AI Gateway |
+|--------|------------------|-------------------|
+| Process structure | Request handling, billing, logging, scheduler in one monolithic event loop | Cost recording (cost-recorder-worker), notifications (notification-worker), scheduler run as **separate processes** |
+| Failure propagation | Billing flush delay directly stalls request processing | Worker failures do not affect the gateway core |
+
+---
+
 ## Key Features
 
 - **Gateway Core** — OIDC → Virtual Key auto-issuance, 3-client × 2 API formats (Anthropic Messages / OpenAI Responses) routing, per-client backend dispatch (Bedrock native / Mantle). Per-team/user/app budgets (HARD_BLOCK / SOFT_WARNING / THROTTLE), rate limits (USER / TEAM / GLOBAL scopes), model ACL, auto-downgrade, usage/ROI aggregation.

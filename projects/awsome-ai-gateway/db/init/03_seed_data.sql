@@ -39,6 +39,19 @@ INSERT INTO auth.users (id, team_id, email, display_name, role, sso_subject) VAL
 ON CONFLICT (id) DO NOTHING;
 
 -- ============================================================
+-- Service-Token Synthetic User (FK target for service_tokens.created_by)
+-- ============================================================
+
+INSERT INTO auth.users (id, team_id, email, display_name, role, sso_subject) VALUES
+    ('00000000-0000-4000-a000-000000000011',
+     '00000000-0000-4000-a000-000000000003',
+     'service-token@system.internal',
+     'Service Token System',
+     'ADMIN',
+     'service-token-system')
+ON CONFLICT (id) DO NOTHING;
+
+-- ============================================================
 -- Default Rotation Policy (GLOBAL, 90 days)
 -- ============================================================
 

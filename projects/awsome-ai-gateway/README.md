@@ -92,6 +92,47 @@ WebSearch(MCP over httpx, SigV4/IRSA, us-east-1 전용) 호출 → 결과 재투
 
 ---
 
+## 타 오픈소스 LLM 프록시 대비 차별점
+
+### 보안 아키텍처: Re-origination vs Relay
+
+일반적인 오픈소스 LLM 프록시는 클라이언트 요청을 받아 업스트림에 **그대로 전달(relay)**합니다. 헤더 조작이나 필터링을 추가하더라도 본질적으로 "통과시키고 일부를 막는" 방식이라, 설정 누락 하나로 자격증명이 새어나가는 구조적 위험이 있습니다.
+
+AWSome AI Gateway는 **re-origination(요청 재구성 발신)** 방식입니다. 수신된 요청을 해체하고, 허용된 필드만 추출한 뒤, 게이트웨이 자체 자격증명(IRSA/SigV4/broker)으로 새 요청을 처음부터 만들어 보냅니다. 클라이언트 키(VK)는 업스트림에 절대 닿지 않고, 업스트림 헤더는 클라이언트에 절대 내려가지 않습니다. 이 경계를 약화시키는 설정 자체가 존재하지 않습니다 — 보안이 구조입니다.
+
+### 토큰 사용량 정확도
+
+| 관점 | 타 오픈소스 | AWSome AI Gateway |
+|------|------------|-------------------|
+| 기본 집계 | provider usage 필드 사용 (동일) | provider usage 필드 사용 (동일) |
+| usage 필드 불완전/부재 시 | 로컬 tiktoken 근사 (Claude 모델에서 오차 발생) | **Bedrock invocationMetrics** 를 billable 기준으로 채택 + 추정 필요 시 **Bedrock CountTokens API** 사용 → AWS billing 단위와 정합 |
+
+### 스트리밍 중단 시 비용 보존
+
+| 관점 | 타 오픈소스 | AWSome AI Gateway |
+|------|------------|-------------------|
+| 비용 기록 시점 | 스트림 자연 종료 시에만 실행 (all-or-nothing) | 스트리밍 중 텍스트 누적 + 중단 감지 시 부분 비용 기록 |
+| 중간 끊김 시 결과 | 이미 소비한 토큰 비용이 **0으로 기록** (계산 로직 자체를 건너뜀) | 끊긴 시점까지의 텍스트를 CountTokens API로 역산하여 **부분 비용 보존** |
+
+→ "근사(inaccuracy)"와 "누락(loss)"은 다른 문제입니다. 타 오픈소스는 완료된 스트림은 부정확하게라도 기록하지만, 중간 끊김은 아무것도 기록하지 않습니다. 우리는 완료든 중단이든 Bedrock 정밀 토큰 카운트로 처리합니다.
+
+### 비용 기록 워커 장애 대응
+
+| 관점 | 타 오픈소스 | AWSome AI Gateway |
+|------|------------|-------------------|
+| 아키텍처 | 리더 1명이 대표로 DB에 flush (Redis lock 기반 단일 리더) | **Redis Stream Consumer Group** — 리더 없이 여러 워커가 나눠 소비 |
+| 리더 장애 시 | 락 TTL만큼 비용 기록 정체 (단일 장애점) | 한 pod가 죽어도 나머지 pod가 즉시 소비 계속 (단일 장애점 없음) |
+| 데드락 방지 | Redis lock으로 동시 쓰기 차단 | Redis가 메시지를 겹치지 않게 자동 분배 — 락 불필요 |
+
+### Cascade 다운 방지
+
+| 관점 | 타 오픈소스 | AWSome AI Gateway |
+|------|------------|-------------------|
+| 프로세스 구조 | 요청 처리·비용·로깅·스케줄러가 monolithic event loop | 비용 기록(cost-recorder-worker), 알림(notification-worker), 스케줄러를 **별도 프로세스로 분리** |
+| 장애 전파 | 비용 flush 지연이 요청 처리 지연으로 직결 | 워커 장애가 gateway 본체에 영향 없음 |
+
+---
+
 ## 주요 기능
 
 - **게이트웨이 코어** — OIDC→Virtual Key 자동 발급, 3-client(claude-code/codex/cowork) × 2-API 규격(Anthropic Messages / OpenAI Responses) 라우팅, 클라이언트별 백엔드 분기(Bedrock native / Mantle). 팀/사용자/앱(client)별 예산(HARD_BLOCK/SOFT_WARNING/THROTTLE), Rate Limit(USER/TEAM/GLOBAL 3-scope), 팀별 모델 접근 제어(allowed_models), 자동 다운그레이드(TEAM scope), 사용량/ROI 집계(`reasoning_tokens`·`web_search_count` 서브메트릭 포함).

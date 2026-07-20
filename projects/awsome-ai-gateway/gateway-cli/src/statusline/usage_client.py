@@ -44,7 +44,10 @@ def fetch_usage(config: StatuslineConfig, virtual_key: str) -> UsageInfo:
 
     resp = requests.get(
         url,
-        headers={"Authorization": f"Bearer {virtual_key}"},
+        headers={
+            "Authorization": f"Bearer {virtual_key}",
+            "User-Agent": "claude-cli/gateway-cli-statusline",
+        },
         timeout=(config.connect_timeout, config.read_timeout),
     )
     resp.raise_for_status()

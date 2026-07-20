@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import structlog
@@ -11,6 +13,9 @@ from botocore.exceptions import ClientError
 
 from app.providers.base import ProviderAdapter
 from app.schemas.domain import TokenUsage
+
+_BEDROCK_POOL_SIZE = int(os.environ.get("BEDROCK_THREAD_POOL_SIZE", "128"))
+_bedrock_executor = ThreadPoolExecutor(max_workers=_BEDROCK_POOL_SIZE, thread_name_prefix="bedrock")
 
 logger = structlog.get_logger(__name__)
 
@@ -79,7 +84,7 @@ class BedrockAdapter(ProviderAdapter):
             client = await self._get_client()
             if path_suffix in ("invoke", ""):
                 response = await loop.run_in_executor(
-                    None,
+                    _bedrock_executor,
                     lambda: client.invoke_model(
                         modelId=model_id,
                         body=request_body,
@@ -98,7 +103,7 @@ class BedrockAdapter(ProviderAdapter):
             elif path_suffix == "converse":
                 parsed_req = json.loads(request_body)
                 response = await loop.run_in_executor(
-                    None,
+                    _bedrock_executor,
                     lambda: client.converse(
                         modelId=model_id,
                         **{k: v for k, v in parsed_req.items() if k != "modelId"},
@@ -167,7 +172,7 @@ class BedrockAdapter(ProviderAdapter):
             client = await self._get_client()
             if path_suffix == "invoke-with-response-stream":
                 response = await loop.run_in_executor(
-                    None,
+                    _bedrock_executor,
                     lambda: client.invoke_model_with_response_stream(
                         modelId=model_id,
                         body=request_body,
@@ -187,7 +192,7 @@ class BedrockAdapter(ProviderAdapter):
             elif path_suffix == "converse-stream":
                 parsed_req = json.loads(request_body)
                 response = await loop.run_in_executor(
-                    None,
+                    _bedrock_executor,
                     lambda: client.converse_stream(
                         modelId=model_id,
                         **{k: v for k, v in parsed_req.items() if k != "modelId"},
@@ -251,7 +256,7 @@ class BedrockAdapter(ProviderAdapter):
                 return sentinel
 
         while True:
-            event = await loop.run_in_executor(None, _next)
+            event = await loop.run_in_executor(_bedrock_executor, _next)
             if event is sentinel:
                 return
             chunk = event.get("chunk", {})
@@ -272,7 +277,7 @@ class BedrockAdapter(ProviderAdapter):
                 return sentinel
 
         while True:
-            event = await loop.run_in_executor(None, _next)
+            event = await loop.run_in_executor(_bedrock_executor, _next)
             if event is sentinel:
                 return
             yield json.dumps(event).encode()

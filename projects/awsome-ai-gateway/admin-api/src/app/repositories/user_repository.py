@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import func, select
+from sqlalchemy import String, all_, any_, bindparam, func, select, update
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import lazyload, selectinload
 
 from app.models.auth import Department, Organization, Team, User, UserRole
 
@@ -19,6 +20,14 @@ class UserRepository:
 
     async def get_default_org(self) -> Organization | None:
         stmt = select(Organization).limit(1)
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_first_org_id(self) -> uuid.UUID | None:
+        """org id 만 단건 조회(멤버·부서 그래프 미로드). sync_all 의 팀 캐시가
+        신규 부서 생성 시 사용할 org 를 1회 확보하기 위한 경량 경로 —
+        ``list_all_orgs`` (부서→팀→멤버 전량 selectinload) 의 OOM 을 회피한다."""
+        stmt = select(Organization.id).order_by(Organization.name).limit(1)
         result = await self._session.execute(stmt)
         return result.scalar_one_or_none()
 
@@ -101,6 +110,12 @@ class UserRepository:
         await self._session.flush()
         return user
 
+    async def flush(self) -> None:
+        """Flush pending ORM changes so a failing write surfaces here (e.g. a
+        UNIQUE email collision) instead of being deferred to a later commit /
+        savepoint release. Lets callers count/act only after a successful flush."""
+        await self._session.flush()
+
     async def update_user_team(self, user_id: uuid.UUID, team_id: uuid.UUID) -> User | None:
         user = await self.get_user(user_id)
         if user is None:
@@ -139,6 +154,93 @@ class UserRepository:
         )
         result = await self._session.execute(stmt)
         return list(result.scalars().unique().all())
+
+    async def list_teams_lite(self) -> list[Team]:
+        """멤버 미포함 경량 팀 조회. sync_all 의 팀 캐시 구축용 —
+        list_all_teams(members selectinload)의 반복 호출로 인한 메모리 폭발을 회피.
+
+        Team.members/department 는 모델 레벨에서 ``lazy="selectin"`` 이므로,
+        ``lazyload`` 로 명시적으로 override 하지 않으면 plain select 여도 여전히
+        멤버 그래프를 eager-load 한다. (id, dept_id, name 컬럼만 필요.)"""
+        stmt = (
+            select(Team)
+            .options(lazyload(Team.members), lazyload(Team.department))
+            .order_by(Team.name)
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def list_departments_lite(self) -> list[Department]:
+        """멤버·팀 미포함 경량 부서 조회. sync_all 의 부서 캐시 구축용.
+
+        Department.teams/organization 도 ``lazy="selectin"`` 기본값이라 lazyload
+        override 로 eager-load 를 차단한다. (id, name 컬럼만 필요.)"""
+        stmt = (
+            select(Department)
+            .options(lazyload(Department.teams), lazyload(Department.organization))
+            .order_by(Department.name)
+        )
+        result = await self._session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def prefetch_users_by_subjects(self, subs: set[str]) -> dict[str, dict]:
+        """sso_subject 집합에 해당하는 기존 유저의 스칼라 스냅샷을 일괄 조회.
+
+        sync_all 의 유저당 get_by_sso_subject(N+1) 를 1~수 회 배열-바인딩 조회로
+        대체한다. ORM 엔티티를 만들지 않고 필요한 컬럼만 SELECT 하여 gate 판정용
+        dict 를 반환한다({sso_subject: {id,email,display_name,team_id,role,is_active}}).
+        subs 가 크면(수만) 청크로 나눠 조회한다(과대 배열 파라미터 회피).
+
+        포함 매칭이므로 `= ANY(:subs::VARCHAR[])` 를 쓴다(deactivate 의 `!= ALL`
+        none-of 와 반대). 배열 단일 파라미터라 요소당 스칼라 바인드 폭발이 없다.
+        """
+        result: dict[str, dict] = {}
+        if not subs:
+            return result
+        subs_list = list(subs)
+        CHUNK = 5000
+        for i in range(0, len(subs_list), CHUNK):
+            chunk = subs_list[i : i + CHUNK]
+            stmt = select(
+                User.sso_subject, User.id, User.email, User.display_name,
+                User.team_id, User.role, User.is_active,
+            ).where(
+                User.sso_subject == any_(
+                    bindparam("subs", value=chunk, type_=ARRAY(String))
+                )
+            )
+            rows = await self._session.execute(stmt)
+            for r in rows:
+                result[r.sso_subject] = {
+                    "id": r.id, "email": r.email, "display_name": r.display_name,
+                    "team_id": r.team_id, "role": r.role, "is_active": r.is_active,
+                }
+        return result
+
+    async def deactivate_missing_oidc_users(
+        self, seen_subjects: set[str], provider: str
+    ) -> int:
+        """provider 유저 중 seen_subjects 에 없고 현재 활성인 유저를 bulk 비활성화.
+
+        sync_all reconcile 전용. ORM 객체를 로드하지 않고 단일 UPDATE 로 처리해
+        1만+ 유저 로드 시의 메모리 폭발을 회피한다. 변경 행 수를 반환한다.
+        """
+        if seen_subjects:
+            subject_filter = User.sso_subject != all_(
+                bindparam("seen", value=list(seen_subjects), type_=ARRAY(String))
+            )
+        else:
+            subject_filter = User.sso_subject.isnot(None)
+        stmt = (
+            update(User)
+            .where(User.provider == provider)
+            .where(User.is_active.is_(True))
+            .where(subject_filter)
+            .values(is_active=False)
+            .execution_options(synchronize_session=False)
+        )
+        result = await self._session.execute(stmt)
+        return result.rowcount or 0
 
     async def list_users(
         self,

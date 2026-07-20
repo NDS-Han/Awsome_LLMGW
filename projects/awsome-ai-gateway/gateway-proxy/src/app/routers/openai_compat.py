@@ -185,12 +185,11 @@ async def _handle_openai(request: Request, path: str):
             _router_service.check_key_scope(auth_context, model_config)
         except PermissionError:
             return JSONResponse(
-                status_code=403,
+                status_code=400,
                 content={
                     "error": {
-                        "type": "authentication_error",
-                        "message": "Model not allowed",
-                        "code": "model_not_allowed",
+                        "type": "invalid_request_error",
+                        "message": f"Your account does not have access to model '{model_config.alias}'. Contact your administrator to request access.",
                     }
                 },
             )
@@ -369,9 +368,9 @@ async def _handle_responses(request: Request):
             _router_service.check_key_scope(auth_context, model_config)
         except PermissionError:
             return JSONResponse(
-                status_code=403,
-                content={"error": {"type": "authentication_error",
-                                    "message": "Model not allowed", "code": "model_not_allowed"}},
+                status_code=400,
+                content={"error": {"type": "invalid_request_error",
+                                    "message": f"Your account does not have access to model '{model_config.alias}'. Contact your administrator to request access."}},
             )
 
     # Pre-reserve RPM + TPM (USER/TEAM/GLOBAL) — same enforcement as chat path.
