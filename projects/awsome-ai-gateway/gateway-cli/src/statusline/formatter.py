@@ -11,12 +11,17 @@ from typing import Optional
 
 from statusline.usage_client import UsageInfo
 
-# Model alias → short display name
-_MODEL_SHORT = {
-    "claude-opus-4-6": "Opus",
-    "claude-sonnet-4-6": "Sonnet",
-    "claude-haiku-4-5": "Haiku",
-}
+def _short_name(alias: str) -> str:
+    """Model alias → short display name (substring match for any format)."""
+    a = alias.lower()
+    if "opus" in a:
+        return "Opus"
+    if "sonnet" in a:
+        return "Sonnet"
+    if "haiku" in a:
+        return "Haiku"
+    parts = alias.rsplit("-", 1)
+    return parts[-1].capitalize() if len(parts) > 1 else alias
 
 
 class Severity(str, Enum):
@@ -106,7 +111,7 @@ def format_status(state: StatuslineState) -> str:
 
     parts = [header]
     for m in sorted_models:
-        short = _MODEL_SHORT.get(m.model, m.model.split(".")[-1])
+        short = _short_name(m.model)
         mc = _MODEL_COLOR.get(short, _WHITE)
 
         tokens = []

@@ -178,13 +178,13 @@ async def run_fallback_loop(
                 # on a fallback candidate just skip (the original 403 was what mattered).
                 if is_original:
                     return FallbackResult(
-                        status=403,
+                        status=400,
                         payload=(
                             json.dumps(
                                 {
                                     "error": {
-                                        "type": "permission_error",
-                                        "message": "Model not allowed for this key",
+                                        "type": "invalid_request_error",
+                                        "message": f"Your account does not have access to model '{candidate_config.alias}'. Contact your administrator to request access.",
                                     }
                                 }
                             ).encode(),

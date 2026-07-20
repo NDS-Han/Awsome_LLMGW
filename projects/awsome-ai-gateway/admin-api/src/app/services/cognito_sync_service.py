@@ -25,6 +25,23 @@ from app.repositories.user_repository import UserRepository
 
 logger = structlog.get_logger()
 
+BATCH_SIZE = 500  # 유저 upsert 배치 commit 단위. 초과 시 commit + expunge_all 로
+                  # identity map 을 비워 sync_all 메모리 상한을 확보한다.
+
+
+def _needs_update(
+    snap: dict, *, email: str, name: str, team_id, role, enabled: bool
+) -> bool:
+    """prefetch gate 판정. _upsert_one_user 의 update 분기와 1:1 동일 조건이어야 한다.
+    (email 이 truthy 이고 다르면) OR display_name/team_id/role/is_active 변경."""
+    return (
+        (bool(email) and snap["email"] != email)
+        or snap["display_name"] != name
+        or snap["team_id"] != team_id
+        or snap["role"] != role
+        or snap["is_active"] != enabled
+    )
+
 
 @dataclass
 class SyncResult:
@@ -37,6 +54,16 @@ class SyncResult:
     # 단일 사용자 sync 대상 유저의 DB id(str). 후속 처리(개인별 allowed_clients/
     # allowed_models)용. Cognito·DB 모두 없는 no-op 이면 None.
     user_id: str | None = None
+
+
+@dataclass
+class _TeamCache:
+    """sync_all 진입 시 1회 구축하는 팀/부서 인덱스. expunge 후에도 안전하도록
+    ORM 객체가 아니라 PK(uuid)만 보유한다."""
+    teams: dict[tuple[uuid.UUID, str], uuid.UUID] = field(default_factory=dict)
+    depts_by_name: dict[str, uuid.UUID] = field(default_factory=dict)
+    default_dept_id: uuid.UUID | None = None
+    org_id: uuid.UUID | None = None
 
 
 class CognitoSyncService:
@@ -66,36 +93,36 @@ class CognitoSyncService:
 
         repo = UserRepository(session)
 
-        # 1. Cognito 그룹 목록 가져오기
+        # 0. 팀/부서 캐시 1회 구축 (멤버 미포함 경량 조회) — 그룹마다 전체 그래프를
+        #    반복 로드하던 것을 대체(OOM 주원인 제거).
+        cache = await self._build_team_cache(repo)
+
+        # 1. Cognito 그룹 목록
         try:
-            groups = await asyncio.to_thread(
-                self._list_all_groups, user_pool_id
-            )
+            groups = await asyncio.to_thread(self._list_all_groups, user_pool_id)
         except Exception as e:
             result.errors.append(f"Failed to list groups: {e}")
             return result
 
-        # 2. 그룹별 멤버 수집 → user_sub 별 소속 그룹 + 프로필 정보 축적
-        #    user_sub → { "email", "name", "enabled", "groups": [group_name, ...] }
+        # 2. 그룹별 멤버 수집 → user_sub 별 프로필/그룹 축적
         user_map: dict[str, dict] = {}
-        # group_name → Team (팀 매핑 가능한 그룹만)
-        team_map: dict[str, Team] = {}
+        # group_name → team_id (팀 매핑 가능한 그룹만)
+        group_team_id: dict[str, uuid.UUID] = {}
 
         for group in groups:
             group_name = group["GroupName"]
-
-            # 팀 매핑 가능한 그룹이면 부서/팀 확보
             parsed = self._parse_group(group_name)
             if parsed is not None:
                 dept_name, team_name = parsed
                 result.groups_synced += 1
                 try:
-                    team = await self._ensure_team(repo, session, dept_name, team_name)
-                    team_map[group_name] = team
+                    tid = await self._ensure_team_id(
+                        repo, session, cache, dept_name, team_name
+                    )
+                    group_team_id[group_name] = tid
                 except Exception as e:
                     result.errors.append(f"Failed to ensure team {team_name}: {e}")
 
-            # 그룹 멤버 가져오기 (admin 그룹 포함 — role 결정에 필요)
             try:
                 members = await asyncio.to_thread(
                     self._list_users_in_group, user_pool_id, group_name
@@ -117,13 +144,12 @@ class CognitoSyncService:
                     }
                 user_map[sub]["groups"].append(group_name)
 
-        # 2b. 전체 유저 목록으로 user_map 보완 (그룹 삭제 시 누락 방지)
+        # 2b. 전체 유저 목록으로 보완 (그룹 삭제 시 누락 방지)
         try:
             all_cognito_users = await asyncio.to_thread(
                 self._list_all_users, user_pool_id
             )
             for cu in all_cognito_users:
-                # sub은 Attributes에 있거나 Username 자체가 sub인 경우도 있음
                 sub = self._get_attr(cu, "sub") or cu.get("Username")
                 if not sub:
                     continue
@@ -137,8 +163,13 @@ class CognitoSyncService:
         except Exception as e:
             result.errors.append(f"Failed to list all users: {e}")
 
-        # 3. 사용자별 DB upsert
+        # 3. 사용자별 DB upsert (배치 commit + expunge 로 메모리 상한)
+        # 유저 upsert 전 기존 유저 스냅샷 일괄 prefetch (per-user 조회 N+1 제거).
+        existing_snaps = await repo.prefetch_users_by_subjects(set(user_map.keys()))
+
         seen_sso_subjects: set[str] = set()
+        default_team_id = uuid.UUID(settings.DEFAULT_TEAM_ID)
+        processed = 0
 
         for sub, info in user_map.items():
             email = info["email"]
@@ -146,102 +177,62 @@ class CognitoSyncService:
             enabled = info["enabled"]
             user_groups: list[str] = info["groups"]
 
-            # 팀 결정: 사용자가 속한 그룹 중 첫 번째 팀 매핑 가능한 그룹
             team_id: uuid.UUID | None = None
             for g in user_groups:
-                if g in team_map:
-                    team_id = team_map[g].id
+                if g in group_team_id:
+                    team_id = group_team_id[g]
                     break
-
             if team_id is None:
-                # 팀 매핑 불가 (admin-only 그룹 등) → DEFAULT_TEAM_ID
-                team_id = uuid.UUID(settings.DEFAULT_TEAM_ID)
+                team_id = default_team_id
 
+            # skip 여부와 무관하게 항상 seen 에 추가 — reconcile(4단계)이 skip 된
+            # 유저를 잘못 비활성화하지 않도록 (불변식).
             seen_sso_subjects.add(sub)
-
-            # Role 결정 (사용자의 실제 그룹 기반)
             role = self._derive_role(email, user_groups)
 
-            # DB upsert
+            # gate: 확실히 안 바뀐 기존 유저는 upsert 를 건너뜀 (DB 왕복 0).
+            # snap None(신규/재생성 새 sub)은 절대 skip 하지 않는다 — email reconcile
+            # 규약(_upsert_one_user 내부)이 보존돼야 하므로 항상 upsert 경로로.
+            snap = existing_snaps.get(sub)
+            if snap is not None and not _needs_update(
+                snap, email=email, name=name, team_id=team_id, role=role, enabled=enabled
+            ):
+                continue
+
             try:
-                # 1차: sso_subject 로 조회.
-                existing = await repo.get_by_sso_subject(sub)
-
-                # 2차 fallback: email 로 재조회. Cognito 유저 삭제·재생성 시 username
-                # (email)은 같아도 새 sub(UUID)가 발급되어 1차 조회가 miss 한다. 이때
-                # 같은 email 의 기존 row 를 재사용 + sso_subject 를 새 sub 로 갱신하면
-                # 새 sub INSERT → email UNIQUE 충돌(IntegrityError 누적, row 미갱신)을
-                # 원천 차단한다. oidc_service._upsert_user 와 동일 규약.
-                if existing is None:
-                    by_email = await repo.get_by_email(email)
-                    if by_email is not None:
-                        logger.info(
-                            "cognito_sync.sso_subject_reconciled",
-                            user_id=str(by_email.id),
-                            email=email,
-                            old_sso_subject=by_email.sso_subject,
-                            new_sso_subject=sub,
-                        )
-                        by_email.sso_subject = sub
-                        existing = by_email
-                        result.users_updated += 1
-
-                if existing is None:
-                    user = User(
-                        id=uuid.uuid4(),
-                        email=email,
-                        display_name=name,
-                        role=role,
-                        sso_subject=sub,
-                        team_id=team_id,
-                        is_active=enabled,
-                        provider=settings.OIDC_PROVIDER_NAME,
+                # SAVEPOINT 로 각 유저 upsert 를 격리. flush 실패(예: email UNIQUE
+                # 충돌)가 발생해도 savepoint 만 롤백되고 외부 트랜잭션은 건강하게
+                # 유지된다 → 이후 배치/잔여 commit + reconcile/stale-team 이 정상 수행.
+                async with session.begin_nested():
+                    await self._upsert_one_user(
+                        repo, sub=sub, email=email, name=name, enabled=enabled,
+                        team_id=team_id, role=role, result=result,
                     )
-                    await repo.create_user(user)
-                    result.users_created += 1
-                else:
-                    changed = False
-                    if existing.email != email:
-                        existing.email = email
-                        changed = True
-                    if existing.display_name != name:
-                        existing.display_name = name
-                        changed = True
-                    if existing.team_id != team_id:
-                        existing.team_id = team_id
-                        changed = True
-                    if existing.role != role:
-                        existing.role = role
-                        changed = True
-                    if existing.is_active != enabled:
-                        existing.is_active = enabled
-                        changed = True
-                    if changed:
-                        result.users_updated += 1
             except Exception as e:
                 result.errors.append(f"Failed to sync user {email}: {e}")
 
-        # 4. Cognito 에 없는 OIDC 사용자 비활성화
+            processed += 1
+            if processed % BATCH_SIZE == 0:
+                await session.commit()
+                session.expunge_all()
+
+        # 잔여분 commit
+        await session.commit()
+
+        # 4. Cognito 에 없는 OIDC 사용자 비활성화 — bulk UPDATE (ORM 전량 로드 제거).
+        #    반드시 전체 upsert 완료 후. seen 에 없는 유저만 비활성화.
         if settings.COGNITO_SYNC_DEACTIVATE_MISSING:
             try:
-                all_users = await repo.list_users(limit=10000)
-                for user in all_users:
-                    if (
-                        user.provider == settings.OIDC_PROVIDER_NAME
-                        and user.sso_subject not in seen_sso_subjects
-                        and user.is_active
-                    ):
-                        user.is_active = False
-                        result.users_deactivated += 1
+                deactivated = await repo.deactivate_missing_oidc_users(
+                    seen_sso_subjects, settings.OIDC_PROVIDER_NAME
+                )
+                result.users_deactivated += deactivated
+                await session.commit()
             except Exception as e:
                 result.errors.append(f"Failed to deactivate missing users: {e}")
 
-        # 5. Cognito 에 없는 팀 정리
-        # team_map에 있는 팀 = Cognito 그룹에서 매핑된 팀
-        # DB의 팀 중 team_map에 없고 Default Team이 아닌 팀 → 멤버를 Default Team으로 이동
-        # 팀 자체는 삭제하지 않음 (usage_logs FK 제약)
-        default_team_id = uuid.UUID(settings.DEFAULT_TEAM_ID)
-        synced_team_ids = {t.id for t in team_map.values()}
+        # 5. Cognito 에 없는 팀 정리 — 멤버 이동을 위해 members 포함 조회 유지.
+        synced_team_ids = set(group_team_id.values())
         try:
             all_teams = await repo.list_all_teams()
             for team in all_teams:
@@ -249,7 +240,6 @@ class CognitoSyncService:
                     continue
                 if team.id in synced_team_ids:
                     continue
-                # 팀 멤버를 Default Team으로 이동
                 moved = [m for m in (team.members or []) if m.is_active]
                 for member in moved:
                     member.team_id = default_team_id
@@ -286,6 +276,12 @@ class CognitoSyncService:
 
         upsert 된(생성/갱신) User 를 반환한다 — sync_user 가 응답 user_id 확보용."""
         settings = get_settings()
+        # Track whether this call mutated an existing row. We flush ONCE at the
+        # end and only then increment users_updated — so a deferred flush failure
+        # (e.g. an email UNIQUE collision that the enclosing SAVEPOINT will roll
+        # back) surfaces here and the counter is NOT bumped for a change that did
+        # not persist.
+        updated = False
         existing = await repo.get_by_sso_subject(sub)
         if existing is None and email:
             by_email = await repo.get_by_email(email)
@@ -297,7 +293,7 @@ class CognitoSyncService:
                 )
                 by_email.sso_subject = sub
                 existing = by_email
-                result.users_updated += 1
+                updated = True
         if existing is None:
             new_user = User(
                 id=uuid.uuid4(), email=email, display_name=name, role=role,
@@ -308,18 +304,27 @@ class CognitoSyncService:
             result.users_created += 1
             return new_user
         else:
-            changed = False
             if email and existing.email != email:
-                existing.email = email; changed = True
+                existing.email = email
+                updated = True
             if existing.display_name != name:
-                existing.display_name = name; changed = True
+                existing.display_name = name
+                updated = True
             if existing.team_id != team_id:
-                existing.team_id = team_id; changed = True
+                existing.team_id = team_id
+                updated = True
             if existing.role != role:
-                existing.role = role; changed = True
+                existing.role = role
+                updated = True
             if existing.is_active != enabled:
-                existing.is_active = enabled; changed = True
-            if changed:
+                existing.is_active = enabled
+                updated = True
+            if updated:
+                # Flush pending mutations so a failure (e.g. UNIQUE email
+                # collision) raises HERE, before we count. If it raises, the
+                # exception propagates to the caller's try/except (recorded in
+                # result.errors) and users_updated stays untouched.
+                await repo.flush()
                 result.users_updated += 1
             return existing
 
@@ -633,6 +638,58 @@ class CognitoSyncService:
         team = Team(id=uuid.uuid4(), dept_id=dept.id, name=team_name)
         await repo.create_team(team)
         return team
+
+    async def _build_team_cache(self, repo: UserRepository) -> _TeamCache:
+        """멤버 미포함 경량 조회로 팀/부서 인덱스를 1회 구축.
+
+        sync_all 이 그룹마다 list_all_orgs/list_all_teams(members selectinload)를
+        반복 호출하던 것을 대체한다 — OOM 의 주원인."""
+        settings = get_settings()
+        cache = _TeamCache()
+        for d in await repo.list_departments_lite():
+            cache.depts_by_name[d.name] = d.id
+        for t in await repo.list_teams_lite():
+            cache.teams[(t.dept_id, t.name)] = t.id
+        # 신규 부서 생성 시 배치할 org id 를 1회 확보(멤버 그래프 미로드).
+        cache.org_id = await repo.get_first_org_id()
+        try:
+            cache.default_dept_id = uuid.UUID(settings.DEFAULT_DEPT_ID)
+        except (ValueError, TypeError):
+            cache.default_dept_id = None
+        return cache
+
+    async def _ensure_team_id(
+        self, repo: UserRepository, session, cache: _TeamCache,
+        dept_name: str | None, team_name: str,
+    ) -> uuid.UUID:
+        """캐시 기반 팀 확보. 없으면 부서·팀을 생성하고 캐시에 즉시 반영한 뒤
+        team_id(uuid)를 반환한다. ORM 객체를 반환하지 않아 expunge 후에도 안전."""
+        settings = get_settings()
+
+        # 부서 id 결정
+        if dept_name is None:
+            dept_id = cache.default_dept_id or uuid.UUID(settings.DEFAULT_DEPT_ID)
+        else:
+            dept_id = cache.depts_by_name.get(dept_name)
+            if dept_id is None:
+                if cache.org_id is None:
+                    raise ValueError(f"Cannot resolve department for {dept_name}")
+                new_dept = Department(
+                    id=uuid.uuid4(), org_id=cache.org_id, name=dept_name
+                )
+                await repo.create_department(new_dept)
+                dept_id = new_dept.id
+                cache.depts_by_name[dept_name] = dept_id
+
+        key = (dept_id, team_name)
+        cached = cache.teams.get(key)
+        if cached is not None:
+            return cached
+
+        team = Team(id=uuid.uuid4(), dept_id=dept_id, name=team_name)
+        await repo.create_team(team)
+        cache.teams[key] = team.id
+        return team.id
 
     @staticmethod
     def _derive_role(email: str, user_groups: list[str]) -> UserRole:

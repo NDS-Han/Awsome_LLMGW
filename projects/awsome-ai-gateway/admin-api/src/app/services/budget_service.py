@@ -160,6 +160,25 @@ class BudgetService:
                 except Exception:
                     logger.warning("seed_spent.redis_set_failed", key=redis_key)
 
+                # Per-app seed must also refresh the total key (client=None) so
+                # enforcement sees the correct aggregate.
+                if client is not None and scope == "USER":
+                    from sqlalchemy import text as sa_text
+                    total_row = await session.execute(
+                        sa_text(
+                            "SELECT COALESCE(SUM(used_usd), 0) "
+                            "FROM budget.budget_usages "
+                            "WHERE scope = 'USER' AND scope_id = :sid AND period = :period"
+                        ),
+                        {"sid": str(sid), "period": item.period},
+                    )
+                    total_val = total_row.scalar() or 0
+                    total_key = _redis_usage_key(scope, str(sid), item.period, None)
+                    try:
+                        await self._cache_mgr._redis.set(total_key, str(total_val))
+                    except Exception:
+                        logger.warning("seed_spent.redis_total_refresh_failed", key=total_key)
+
                 res.after_usd = item.spent_usd
 
                 await audit_logger.log(

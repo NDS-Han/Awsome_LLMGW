@@ -631,11 +631,11 @@ async def count_tokens(request: Request) -> JSONResponse:
             _router_service.check_key_scope(auth_context, model_config)
         except PermissionError:
             return JSONResponse(
-                status_code=403,
+                status_code=400,
                 content={
                     "error": {
-                        "type": "permission_error",
-                        "message": "Model not allowed for this key",
+                        "type": "invalid_request_error",
+                        "message": f"Your account does not have access to model '{model_config.alias}'. Contact your administrator to request access.",
                     }
                 },
             )
