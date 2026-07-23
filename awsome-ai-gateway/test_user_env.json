@@ -1,0 +1,10 @@
+{
+  "virtual_key": "vk-70a900afbe77044bdeb07ad4ebfa16b0d51c2b1ac660630d9063ee68ba15910f",
+  "key_id": "77f025dc-a241-4a04-b151-8f892b411088",
+  "user_id": "b0a9c1dc-e42f-4e65-91c7-f0976794cd5a",
+  "team_id": "00000000-0000-4000-a000-000000000003",
+  "email": "tester@example.com",
+  "budget_usd": "100",
+  "expires_at": "2026-07-24T01:29:01.780183+00:00",
+  "gateway_endpoint": "http://localhost:8000"
+}
